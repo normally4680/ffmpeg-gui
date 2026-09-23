@@ -1,0 +1,58 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'          # 只有推送形如 v1.0.0、v1.0.1 的 tag 时才触发
+  workflow_dispatch:  # 也允许在 Actions 页面手动触发
+
+permissions:
+  contents: write     # 发布 Release 需要写权限
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'    # 用 3.12 兼容性最好，PyQt5 有预编译 wheel
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyQt5
+          pip install pyinstaller
+
+      - name: 用 PyInstaller 打包
+        run: |
+          pyinstaller -w --name ffmpeg-gui main.py
+
+      - name: 复制说明文件到输出目录
+        run: |
+          copy README.md dist\ffmpeg-gui\
+          copy LICENSE dist\ffmpeg-gui\
+
+      - name: 压缩成 zip
+        run: |
+          Compress-Archive -Path dist\ffmpeg-gui\* -DestinationPath ffmpeg-gui.zip
+
+      - name: 上传 artifact（可选，便于在 Actions 页面下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-gui-windows
+          path: ffmpeg-gui.zip
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ffmpeg-gui.zip
+          generate_release_notes: true    # 自动生成 Release 说明
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
