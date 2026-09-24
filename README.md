@@ -43,7 +43,7 @@
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/<你的用户名>/ffmpeg-gui.git
+git clone https://github.com/normally4680/ffmpeg-gui.git
 cd ffmpeg-gui
 
 # 2. 创建虚拟环境
@@ -88,8 +88,7 @@ python main.py
 ffmpeg-gui/
 ├── main.py              # 主程序（UI + 逻辑）
 ├── requirements.txt     # 依赖清单
-├── README.md
-└── screenshots/         # 界面截图（可选）
+└── README.md
 ```
 
 ## 🧱 技术栈
@@ -113,10 +112,6 @@ pyinstaller -w --icon=your_icon.ico main.py
 - [x] 视频索引修复（Remux）
 - [x] 文件夹递归扫描
 - [x] 媒体信息查询
-- [ ] 自定义命令编辑器（手动输入 FFmpeg 参数）
-- [ ] 处理队列与暂停/恢复
-- [ ] 硬件加速编码（NVENC / QSV）
-- [ ] 跨平台支持（macOS / Linux）
 
 ## 🤝 贡献
 
