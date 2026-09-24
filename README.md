@@ -23,7 +23,6 @@
 
 ## 📸 界面预览
 
-> 建议截图放到 `screenshots/` 目录下，然后在这里引用，例如：
 ![主界面](screenshots/main.png)
 
 ## 🔧 环境要求
