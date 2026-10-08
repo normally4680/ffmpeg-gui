@@ -71,6 +71,96 @@ QProgressBar {
 """
 
 # ==========================================
+# 支持拖拽的控件
+# ==========================================
+MEDIA_EXTS = {
+    ".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".webm",
+    ".m4v", ".wmv", ".mpg", ".mpeg", ".rmvb",
+    ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma",
+}
+SUB_EXTS = {".srt", ".ass", ".vtt", ".ssa", ".sub"}
+
+
+class DropListWidget(QListWidget):
+    """支持拖入文件/文件夹的列表控件"""
+    files_dropped = pyqtSignal(list)   # 拖入后收集到的文件路径列表
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+
+        paths = []
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if not path:
+                continue
+            if os.path.isdir(path):
+                for root, _, names in os.walk(path):
+                    for name in names:
+                        if os.path.splitext(name)[1].lower() in MEDIA_EXTS:
+                            paths.append(os.path.join(root, name))
+            elif os.path.isfile(path):
+                if os.path.splitext(path)[1].lower() in MEDIA_EXTS:
+                    paths.append(path)
+
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
+class DropSubtitleEdit(QLineEdit):
+    """支持拖入字幕文件的输入框"""
+    file_dropped = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if os.path.isfile(path) and os.path.splitext(path)[1].lower() in SUB_EXTS:
+                self.setText(path)
+                self.file_dropped.emit(path)
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+# ==========================================
 # 核心执行线程，防止界面卡死
 # ==========================================
 class FFmpegWorker(QThread):
@@ -306,7 +396,7 @@ class MainWindow(QMainWindow):
         file_group = QGroupBox("1. 选择媒体文件（支持批量）")
         file_layout = QHBoxLayout()
 
-        self.file_list = QListWidget()
+        self.file_list = DropListWidget()
         self.file_list.setSelectionMode(QListWidget.ExtendedSelection)
 
         # 右侧按钮竖排：统一高度和间距，方便计算总高
@@ -379,7 +469,7 @@ class MainWindow(QMainWindow):
         # 字幕参数
         self.lbl_sub = QLabel("字幕文件:")
         self.lbl_sub.setFixedHeight(PARAM_H)
-        self.edit_sub = QLineEdit()
+        self.edit_sub = DropSubtitleEdit()
         self.edit_sub.setReadOnly(True)
         self.edit_sub.setMinimumWidth(200)
         self.edit_sub.setFixedHeight(PARAM_H)
@@ -474,6 +564,8 @@ class MainWindow(QMainWindow):
         self.btn_open_out.clicked.connect(self.open_output_folder)
         self.file_list.itemSelectionChanged.connect(self.on_file_selection_changed)
         self.btn_add_folder.clicked.connect(self.add_folder)
+        self.file_list.files_dropped.connect(self._on_files_dropped)
+        self.edit_sub.file_dropped.connect(self._on_subtitle_dropped)
 
         # 初始更新参数显示
         self.update_mode_params(0)
@@ -488,6 +580,9 @@ class MainWindow(QMainWindow):
             self.log_text.append(f"✅ 已检测到 FFmpeg: {self.ffmpeg_path}")
             self.log_text.append(
                 "提示：无编码模式（截取、封装、提取）速度极快；转码模式较慢。\n"
+            )
+            self.log_text.append(
+                "提示：可以直接把媒体文件/文件夹拖入列表，把字幕文件拖入字幕框。\n"
             )
 
     def update_mode_params(self, index):
@@ -523,6 +618,18 @@ class MainWindow(QMainWindow):
         )
         if files:
             self._add_files_to_list(files)
+
+    def _on_files_dropped(self, files):
+        """处理从外部拖入到列表的媒体文件"""
+        added = self._add_files_to_list(files)
+        if added > 0:
+            self.log_text.append(f"📥 拖入添加了 {added} 个文件")
+        else:
+            self.log_text.append("📥 拖入的文件已在列表中")
+
+    def _on_subtitle_dropped(self, path):
+        """处理从外部拖入的字幕文件"""
+        self.log_text.append(f"📥 已选择字幕: {os.path.basename(path)}")
 
     def add_folder(self):
         """选择文件夹，递归扫描其中所有媒体文件并加入列表"""
