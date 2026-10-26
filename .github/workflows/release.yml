@@ -30,10 +30,13 @@ jobs:
 
       - name: 用 PyInstaller 打包
         run: |
-          pyinstaller -F -w --icon=app.ico --add-data "app.ico;." --name ffmpeg-gui main.py
+          pyinstaller -w --icon=app.ico --add-data "app.ico;." --name ffmpeg-gui main.py
 
-      - name: 复制说明文件到输出目录
+      - name: 复制说明文件和图标到输出目录
         run: |
+          # 检查目录内容，方便排查
+          dir dist\ffmpeg-gui\
+          # 复制 README 和 LICENSE
           copy README.md dist\ffmpeg-gui\
           copy LICENSE dist\ffmpeg-gui\
 
@@ -51,7 +54,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ffmpeg-gui.zip
-          generate_release_notes: true    # 自动生成 Release 说明
+          generate_release_notes: true
           draft: false
           prerelease: false
         env:
