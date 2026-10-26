@@ -28,32 +28,52 @@ jobs:
           pip install PyQt5
           pip install pyinstaller
 
-      - name: 用 PyInstaller 打包
+      # ==============================
+      # 1. 打包方式一：单执行文件 (Onefile)
+      # ==============================
+      - name: 打包 - 单文件版 (Onefile)
         run: |
-          pyinstaller -w --icon=app.ico --add-data "app.ico;." --name ffmpeg-gui main.py
+          pyinstaller -F -w --icon=app.ico --add-data "app.ico;." --name ffmpeg-gui-single main.py
+          copy README.md dist\
+          copy LICENSE dist\
 
-      - name: 复制说明文件和图标到输出目录
+      # ==============================
+      # 2. 打包方式二：目录分离版 (Onedir)
+      # ==============================
+      - name: 打包 - 文件夹版 (Onedir)
         run: |
-          # 检查目录内容，方便排查
-          dir dist\ffmpeg-gui\
-          # 复制 README 和 LICENSE
-          copy README.md dist\ffmpeg-gui\
-          copy LICENSE dist\ffmpeg-gui\
+          pyinstaller -w --icon=app.ico --add-data "app.ico;." --name ffmpeg-gui-folder main.py
+          copy README.md dist\ffmpeg-gui-folder\
+          copy LICENSE dist\ffmpeg-gui-folder\
 
-      - name: 压缩成 zip
+      # ==============================
+      # 3. 分别压缩为 ZIP
+      # ==============================
+      - name: 压缩为 ZIP 文件
         run: |
-          Compress-Archive -Path dist\ffmpeg-gui\* -DestinationPath ffmpeg-gui.zip
+          # 单文件版直接把 exe 和说明文档打包进 zip
+          Compress-Archive -Path dist\ffmpeg-gui-single.exe, dist\README.md, dist\LICENSE -DestinationPath ffmpeg-gui-single.zip
+          
+          # 文件夹版把整个 ffmpeg-gui-folder 目录打包进 zip
+          Compress-Archive -Path dist\ffmpeg-gui-folder\* -DestinationPath ffmpeg-gui-folder.zip
 
-      - name: 上传 artifact（可选，便于在 Actions 页面下载）
+      - name: 上传 artifact（供 Actions 页面下载备份）
         uses: actions/upload-artifact@v4
         with:
-          name: ffmpeg-gui-windows
-          path: ffmpeg-gui.zip
+          name: ffmpeg-gui-builds
+          path: |
+            ffmpeg-gui-single.zip
+            ffmpeg-gui-folder.zip
 
+      # ==============================
+      # 4. 发布 Release
+      # ==============================
       - name: 发布 Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ffmpeg-gui.zip
+          files: |
+            ffmpeg-gui-single.zip
+            ffmpeg-gui-folder.zip
           generate_release_notes: true
           draft: false
           prerelease: false
