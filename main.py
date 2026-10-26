@@ -25,6 +25,7 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QSplitter,
     QSizePolicy,
+    QSpinBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon
@@ -185,46 +186,43 @@ class FFmpegWorker(QThread):
         total = len(self.tasks)
         for idx, (cmd, output_file) in enumerate(self.tasks):
             self.log_signal.emit(f"\n[{idx+1}/{total}] 开始处理: {os.path.basename(output_file)}")
-
+            
             try:
                 # Windows下隐藏黑框
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 startupinfo.wShowWindow = subprocess.SW_HIDE
 
-                # ============ 新增：处理智能音频占位符 ============
+                # ============ 重构：更安全的智能音频占位符替换 ============
                 if "__SMART_AUDIO__" in cmd:
                     cmd.remove("__SMART_AUDIO__")
-                    # 找到输入文件路径 (紧跟 -i 的参数)
-                    input_file = ""
-                    try:
-                        idx = cmd.index("-i")
-                        input_file = cmd[idx + 1]
-                    except ValueError:
-                        pass
                     
+                    # 用更安全的方式获取输入文件
+                    input_file = ""
+                    if "-i" in cmd:
+                        input_file = cmd[cmd.index("-i") + 1]
+                    
+                    audio_params = []
                     if input_file:
-                        # 快速探测第一条音频流的码率
                         audio_bitrate = self.get_audio_bitrate(input_file)
                         if audio_bitrate > 192000:
                             self.log_signal.emit(f"   🔊 音频智能转码 (源码率 {audio_bitrate/1000:.0f}k > 192k)")
-                            cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+                            audio_params = ["-c:a", "aac", "-b:a", "192k"]
                         else:
                             self.log_signal.emit(f"   🔊 音频智能复制 (源码率 {audio_bitrate/1000:.0f}k <= 192k)")
-                            cmd.extend(["-c:a", "copy"])
+                            audio_params = ["-c:a", "copy"]
                     else:
-                        # 找不到输入文件兜底
-                        cmd.extend(["-c:a", "copy"])
+                        audio_params = ["-c:a", "copy"]
                     
-                    # 确保音频参数在输出文件之前（如果有输出文件）
-                    if len(cmd) > 1 and not cmd[-1].startswith("-"):
-                        output_file = cmd.pop()
-                        cmd.append(output_file)
+                    # 安全重组命令：取出输出文件，添加音频参数，再把输出文件放回最后
+                    out_file = cmd[-1]
+                    cmd = cmd[:-1]
+                    cmd.extend(audio_params)
+                    cmd.append(out_file)
+                # ==============================================================
 
-                # ======= 新增：把完整的命令打印到日志，方便复制和排查 =======
-                cmd_str = subprocess.list2cmdline(cmd)
-                self.log_signal.emit(f"💻 执行命令: {cmd_str}")
-                # ==========================================================
+                # 打印最终命令
+                self.log_signal.emit(f"💻 执行命令: {subprocess.list2cmdline(cmd)}")
 
                 process = subprocess.Popen(
                     cmd,
@@ -235,8 +233,45 @@ class FFmpegWorker(QThread):
                     startupinfo=startupinfo,
                 )
 
+                last_emit = 0
+                last_line = ""
+                # 核心修复：无论读取日志发生什么异常，必须确保进程被等待
+                try:
+                    for line in process.stdout:
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        if "error" in line.lower() or "warning" in line.lower():
+                            self.log_signal.emit(line)
+                            continue
+
+                        now = time.time()
+                        if ("frame=" in line or "size=" in line or "speed=" in line):
+                            if now - last_emit >= 2.0:
+                                self.log_signal.emit(line)
+                                last_emit = now
+                                last_line = line
+                        else:
+                            self.log_signal.emit(line)
+                except Exception as read_err:
+                    self.log_signal.emit(f"⚠️ 读取日志时发生中断: {read_err}")
+                finally:
+                    # 无论中间发生什么，绝对保证等待进程结束
+                    process.wait()
+                    if process.stdout:
+                        process.stdout.close()
+
+                if last_line:
+                    self.log_signal.emit(last_line)
+
+                if process.returncode == 0:
+                    self.log_signal.emit(f"✅ 成功: {os.path.basename(output_file)}")
+                else:
+                    self.log_signal.emit(f"❌ 失败 (返回码 {process.returncode}): {os.path.basename(output_file)}")
+
             except Exception as e:
-                self.log_signal.emit(f"❌ 发生异常: {str(e)}")
+                self.log_signal.emit(f"❌ 发生严重异常: {str(e)}")
 
             self.progress_signal.emit(idx + 1, total)
 
@@ -620,6 +655,24 @@ class MainWindow(QMainWindow):
         self.check_smart_audio = QCheckBox("智能音频控制 (源>192k则重编码)")
         self.check_smart_audio.setFixedHeight(PARAM_H)
 
+        # --- 新增：CRF 质量输入框 ---
+        self.lbl_crf = QLabel("CRF:")
+        self.lbl_crf.setFixedHeight(PARAM_H)
+        self.spin_crf = QSpinBox()
+        self.spin_crf.setRange(18, 35)       # 常用的 CRF 范围
+        self.spin_crf.setValue(23)           # 默认 23
+        self.spin_crf.setFixedHeight(PARAM_H)
+        self.spin_crf.setFixedWidth(60)
+
+        # --- 新增：硬件加速复选框 ---
+        self.check_nvenc = QCheckBox("Nvidia 硬编")
+        self.check_nvenc.setFixedHeight(PARAM_H)
+        self.check_nvenc.setEnabled(False)   # 初始禁用，检测到才启用
+
+        self.check_qsv = QCheckBox("Intel 硬编")
+        self.check_qsv.setFixedHeight(PARAM_H)
+        self.check_qsv.setEnabled(False)     # 初始禁用，检测到才启用
+
         # 字幕参数
         self.lbl_sub = QLabel("字幕文件:")
         self.lbl_sub.setFixedHeight(PARAM_H)
@@ -639,6 +692,11 @@ class MainWindow(QMainWindow):
         param_layout.addWidget(self.edit_sub, stretch=1)
         param_layout.addWidget(self.btn_select_sub)
         param_layout.addWidget(self.check_smart_audio)
+        param_layout.addWidget(self.lbl_crf)
+        param_layout.addWidget(self.spin_crf)
+        param_layout.addWidget(self.check_nvenc)
+        param_layout.addWidget(self.check_qsv)
+
         param_layout.addStretch()
 
         param_group.setLayout(param_layout)
@@ -722,9 +780,15 @@ class MainWindow(QMainWindow):
         self.file_list.files_dropped.connect(self._on_files_dropped)
         self.edit_sub.file_dropped.connect(self._on_subtitle_dropped)
         self.btn_scan_overhead.clicked.connect(self.scan_overhead)
+        # 硬件加速互斥逻辑
+        self.check_nvenc.stateChanged.connect(self.on_nvenc_toggled)
+        self.check_qsv.stateChanged.connect(self.on_qsv_toggled)
 
         # 初始更新参数显示
         self.update_mode_params(0)
+        
+        # 程序启动时异步检测硬件
+        self.detect_hardware_accel()
 
     def check_env(self):
         """检查 FFmpeg 环境"""
@@ -741,14 +805,64 @@ class MainWindow(QMainWindow):
                 "提示：可以直接把媒体文件/文件夹拖入列表，把字幕文件拖入字幕框。\n"
             )
 
+    def on_nvenc_toggled(self, state):
+        """勾选 N卡 时，取消勾选 Intel"""
+        if state == Qt.Checked:
+            self.check_qsv.setChecked(False)
+
+    def on_qsv_toggled(self, state):
+        """勾选 Intel 时，取消勾选 N卡"""
+        if state == Qt.Checked:
+            self.check_nvenc.setChecked(False)
+
+    def detect_hardware_accel(self):
+        """启动时检测硬件加速支持情况"""
+        if not self.ffmpeg_path:
+            return
+
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+
+            # 读取 ffmpeg 支持的编码器列表
+            cmd = [self.ffmpeg_path, "-hide_banner", "-encoders"]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, 
+                encoding='utf-8', errors='ignore', check=True,
+                startupinfo=startupinfo
+            )
+            encoders = result.stdout
+
+            has_nvenc = "hevc_nvenc" in encoders
+            has_qsv = "hevc_qsv" in encoders
+
+            self.check_nvenc.setEnabled(has_nvenc)
+            self.check_qsv.setEnabled(has_qsv)
+
+            msg = "🔍 硬件加速检测: "
+            if has_nvenc:
+                msg += "[Nvidia NVENC 支持] "
+            if has_qsv:
+                msg += "[Intel QSV 支持] "
+            
+            if not has_nvenc and not has_qsv:
+                msg += "未检测到支持的硬编硬件，将默认使用 CPU 软编。"
+            else:
+                self.log_text.append(msg)
+                
+        except Exception as e:
+            self.log_text.append(f"⚠️ 硬件加速检测失败: {str(e)}")
+
     def update_mode_params(self, index):
-        """根据模式更新参数显示"""
         mode = self.combo_mode.currentText()
 
-        # 隐藏所有动态参数
+        # 隐藏所有动态参数 (加入新增的控件)
         for w in [
             self.check_start, self.edit_start, self.check_end, self.edit_end,
-            self.lbl_sub, self.edit_sub, self.btn_select_sub, self.check_smart_audio
+            self.lbl_sub, self.edit_sub, self.btn_select_sub, 
+            self.check_smart_audio, self.lbl_crf, self.spin_crf,
+            self.check_nvenc, self.check_qsv
         ]:
             w.hide()
 
@@ -761,8 +875,17 @@ class MainWindow(QMainWindow):
             self.lbl_sub.show()
             self.edit_sub.show()
             self.btn_select_sub.show()
-        elif "极简压缩" in mode:      # ← 新增
+        elif "极简压缩" in mode:
             self.check_smart_audio.show()
+            self.lbl_crf.show()
+            self.spin_crf.show()
+            self.check_nvenc.show()
+            self.check_qsv.show()
+        elif "视频转码" in mode:
+            self.lbl_crf.show()
+            self.spin_crf.show()
+            self.check_nvenc.show()
+            self.check_qsv.show()
 
     def add_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -952,6 +1075,9 @@ class MainWindow(QMainWindow):
         mode = self.combo_mode.currentText()
         suffix = self.edit_suffix.text().strip()
 
+        # 提前获取用户设置的 CRF 值
+        crf_val = str(self.spin_crf.value())
+
         # ============ 特例：无编码合并视频 ============
         if "无编码合并" in mode:
             if self.file_list.count() < 2:
@@ -1007,8 +1133,8 @@ class MainWindow(QMainWindow):
             # 确定输出文件名
             if "提取" in mode:
                 out_name = f"{base_name}{suffix}.mka"  # 提取音频，默认使用 .mka
-            elif "转码" in mode:
-                out_name = f"{base_name}{suffix}.mp4"
+            elif "转码" in mode or "压缩" in mode:
+                out_name = f"{base_name}{suffix}.mp4"  # 转码和压缩统一输出 mp4
             else:
                 out_name = f"{base_name}{suffix}{ext}"
 
@@ -1051,13 +1177,20 @@ class MainWindow(QMainWindow):
                 cmd.append(output_file)
 
             elif "极简压缩" in mode:
-                cmd.extend([
-                    "-i", input_file,
-                    "-c:v", "libx265",
-                    "-crf", "23",
-                    "-tag:v", "hvc1",
-                ])
+                cmd.extend(["-i", input_file])
                 
+                # 视频编码器与参数映射
+                if self.check_nvenc.isChecked():
+                    # N卡 H.265: 使用 cq 和 vbr 模式
+                    cmd.extend(["-c:v", "hevc_nvenc", "-preset", "p4", "-cq", crf_val, "-rc", "vbr", "-tag:v", "hvc1"])
+                elif self.check_qsv.isChecked():
+                    # Intel H.265: 使用 global_quality
+                    cmd.extend(["-c:v", "hevc_qsv", "-global_quality", crf_val, "-tag:v", "hvc1"])
+                else:
+                    # CPU 纯软编
+                    cmd.extend(["-c:v", "libx265", "-crf", crf_val, "-tag:v", "hvc1"])
+                
+                # 智能音频控制
                 if self.check_smart_audio.isChecked():
                     # 留个标记，让后台 Worker 在真正执行前去探测源音频并替换
                     cmd.append("__SMART_AUDIO__")
@@ -1067,7 +1200,18 @@ class MainWindow(QMainWindow):
                 cmd.append(output_file)
 
             elif "视频转码" in mode:
-                cmd.extend(["-i", input_file, "-c:v", "libx264", "-c:a", "aac", output_file])
+                cmd.extend(["-i", input_file])
+                
+                # 视频编码器与参数映射 (H.264)
+                if self.check_nvenc.isChecked():
+                    cmd.extend(["-c:v", "h264_nvenc", "-preset", "p4", "-cq", crf_val])
+                elif self.check_qsv.isChecked():
+                    cmd.extend(["-c:v", "h264_qsv", "-global_quality", crf_val])
+                else:
+                    cmd.extend(["-c:v", "libx264", "-crf", crf_val])
+                
+                # 音频固定转码为 AAC
+                cmd.extend(["-c:a", "aac", output_file])
 
             tasks.append((cmd, output_file))
 
