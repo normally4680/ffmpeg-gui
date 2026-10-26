@@ -30,7 +30,7 @@ jobs:
 
       - name: 用 PyInstaller 打包
         run: |
-          pyinstaller -w --name ffmpeg-gui main.py
+          pyinstaller -F -w --icon=app.ico --add-data "app.ico;." --name ffmpeg-gui main.py
 
       - name: 复制说明文件到输出目录
         run: |

@@ -24,8 +24,17 @@ from PyQt5.QtWidgets import (
     QTextEdit,
     QCheckBox,
     QSplitter,
+    QSizePolicy,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QIcon
+
+# 增加这个函数，用于寻找打包后的资源文件
+def resource_path(relative_path):
+    """获取资源的绝对路径，兼容 PyInstaller 单文件打包"""
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
 
 # ==========================================
 # 全局样式表
@@ -178,45 +187,53 @@ class FFmpegWorker(QThread):
             self.log_signal.emit(f"\n[{idx+1}/{total}] 开始处理: {os.path.basename(output_file)}")
 
             try:
+                # Windows下隐藏黑框
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 startupinfo.wShowWindow = subprocess.SW_HIDE
 
-                process = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    encoding="utf-8", errors="ignore", startupinfo=startupinfo,
-                )
-
-                last_emit = 0
-                last_line = ""
-                for line in process.stdout:
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    # 错误和警告立即显示
-                    if "error" in line.lower() or "warning" in line.lower():
-                        self.log_signal.emit(line)
-                        continue
-
-                    # 进度行：最多每 2 秒刷新一次
-                    now = time.time()
-                    if ("frame=" in line or "size=" in line or "speed=" in line):
-                        if now - last_emit >= 2.0:
-                            self.log_signal.emit(line)
-                            last_emit = now
-                            last_line = line
+                # ============ 新增：处理智能音频占位符 ============
+                if "__SMART_AUDIO__" in cmd:
+                    cmd.remove("__SMART_AUDIO__")
+                    # 找到输入文件路径 (紧跟 -i 的参数)
+                    input_file = ""
+                    try:
+                        idx = cmd.index("-i")
+                        input_file = cmd[idx + 1]
+                    except ValueError:
+                        pass
+                    
+                    if input_file:
+                        # 快速探测第一条音频流的码率
+                        audio_bitrate = self.get_audio_bitrate(input_file)
+                        if audio_bitrate > 192000:
+                            self.log_signal.emit(f"   🔊 音频智能转码 (源码率 {audio_bitrate/1000:.0f}k > 192k)")
+                            cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+                        else:
+                            self.log_signal.emit(f"   🔊 音频智能复制 (源码率 {audio_bitrate/1000:.0f}k <= 192k)")
+                            cmd.extend(["-c:a", "copy"])
                     else:
-                        self.log_signal.emit(line)
+                        # 找不到输入文件兜底
+                        cmd.extend(["-c:a", "copy"])
+                    
+                    # 确保音频参数在输出文件之前（如果有输出文件）
+                    if len(cmd) > 1 and not cmd[-1].startswith("-"):
+                        output_file = cmd.pop()
+                        cmd.append(output_file)
 
-                process.wait()
-                if last_line:
-                    self.log_signal.emit(last_line)   # 补最后一条进度
+                # ======= 新增：把完整的命令打印到日志，方便复制和排查 =======
+                cmd_str = subprocess.list2cmdline(cmd)
+                self.log_signal.emit(f"💻 执行命令: {cmd_str}")
+                # ==========================================================
 
-                if process.returncode == 0:
-                    self.log_signal.emit(f"✅ 成功: {os.path.basename(output_file)}")
-                else:
-                    self.log_signal.emit(f"❌ 失败 (返回码 {process.returncode})")
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    encoding="utf-8",
+                    errors="ignore",
+                    startupinfo=startupinfo,
+                )
 
             except Exception as e:
                 self.log_signal.emit(f"❌ 发生异常: {str(e)}")
@@ -224,6 +241,34 @@ class FFmpegWorker(QThread):
             self.progress_signal.emit(idx + 1, total)
 
         self.finished_signal.emit()
+
+    def get_audio_bitrate(self, file_path):
+        """获取第一条音频流的码率(bps)，失败返回0"""
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            
+            # 用 ffprobe 查找 ffmpeg 的路径
+            ffprobe_path = shutil.which("ffprobe")
+            if not ffprobe_path:
+                return 0
+
+            cmd = [
+                ffprobe_path, "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=bit_rate",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                file_path
+            ]
+            res = subprocess.run(
+                cmd, capture_output=True, text=True, 
+                check=True, timeout=5, startupinfo=startupinfo
+            )
+            out = res.stdout.strip()
+            return int(float(out)) if out and out != "N/A" else 0
+        except Exception:
+            return 0
 
 class DurationWorker(QThread):
     """后台读取媒体时长和文件大小，避免阻塞 UI"""
@@ -368,6 +413,100 @@ class MediaInfoWorker(QThread):
         self.info_signal.emit("\n" + "=" * 60 + "\n")
         self.finished_signal.emit()
 
+class OverheadScannerWorker(QThread):
+    """后台扫描文件冗余度"""
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal()
+
+    def __init__(self, ffprobe_path, files):
+        super().__init__()
+        self.ffprobe_path = ffprobe_path
+        self.files = files
+
+    def run(self):
+        self.log_signal.emit("=" * 60)
+        self.log_signal.emit(f"🔍 开始扫描文件冗余度（共 {len(self.files)} 个文件）")
+        self.log_signal.emit("=" * 60)
+
+        for file_path in self.files:
+            filename = os.path.basename(file_path)
+            try:
+                cmd = [
+                    self.ffprobe_path, "-v", "error",
+                    "-show_entries", "format=bit_rate,size,duration",
+                    "-show_entries", "stream=codec_type,bit_rate",
+                    "-of", "json", file_path
+                ]
+                
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    encoding="utf-8", errors="ignore", check=True,
+                    timeout=15, startupinfo=startupinfo
+                )
+                
+                d = json.loads(result.stdout)
+                
+                # 计算容器总码率
+                fmt = d.get('format', {})
+                fmt_rate_str = fmt.get('bit_rate', '0')
+                
+                # 兼容某些容器没有 bit_rate 的情况，用大小和时长反推
+                if fmt_rate_str in ('0', 'N/A') and 'size' in fmt and 'duration' in fmt:
+                    try:
+                        size = int(fmt['size'])
+                        duration = float(fmt['duration'])
+                        fmt_rate = (size * 8) / duration if duration > 0 else 0
+                    except:
+                        fmt_rate = 0
+                else:
+                    try:
+                        fmt_rate = int(float(fmt_rate_str))
+                    except:
+                        fmt_rate = 0
+
+                # 计算音视频流码率之和
+                stream_rate = 0
+                for s in d.get('streams', []):
+                    if s.get('codec_type') in ('video', 'audio'):
+                        br = s.get('bit_rate', '0')
+                        try:
+                            stream_rate += int(float(br))
+                        except:
+                            pass
+
+                # 判断冗余度
+                if fmt_rate > 0 and stream_rate > 0:
+                    overhead = (fmt_rate - stream_rate) / fmt_rate * 100
+                    
+                    # 防止某些 VBR 流码率虚高导致负数
+                    if overhead < 0:
+                        overhead = 0.0
+                        
+                    if overhead > 15:
+                        status = "⚠️ 存在明显封装冗余或垃圾数据"
+                    else:
+                        status = "✅ 码率匹配正常"
+                        
+                    self.log_signal.emit(f"📄 {filename}")
+                    self.log_signal.emit(f"   容器总码率: {fmt_rate/1e6:.2f} Mbps | 流码率之和: {stream_rate/1e6:.2f} Mbps")
+                    self.log_signal.emit(f"   冗余占比: {overhead:.1f}% - {status}")
+                else:
+                    self.log_signal.emit(f"📄 {filename}")
+                    self.log_signal.emit("   ❓ 无法计算（可能缺少元数据或流码率信息）")
+                    
+            except Exception as e:
+                self.log_signal.emit(f"📄 {filename}")
+                self.log_signal.emit(f"   ❌ 扫描失败: {str(e)}")
+                
+            self.log_signal.emit("")  # 空行分隔
+
+        self.log_signal.emit("=" * 60 + "\n")
+        self.finished_signal.emit()
+
 # ==========================================
 # 主界面
 # ==========================================
@@ -395,14 +534,14 @@ class MainWindow(QMainWindow):
         # --- 1. 文件选择区（列表在左，按钮竖排在右） ---
         file_group = QGroupBox("1. 选择媒体文件（支持批量）")
         file_layout = QHBoxLayout()
+        file_layout.setContentsMargins(10, 15, 10, 10)
 
         self.file_list = DropListWidget()
         self.file_list.setSelectionMode(QListWidget.ExtendedSelection)
 
-        # 右侧按钮竖排：统一高度和间距，方便计算总高
-        BUTTON_HEIGHT = 36   # 单个按钮高度
-        BUTTON_GAP = 8       # 按钮之间间距
-
+        # 右侧按钮竖排
+        BUTTON_HEIGHT = 32
+        BUTTON_GAP = 8
         file_btn_layout = QVBoxLayout()
         file_btn_layout.setSpacing(BUTTON_GAP)
         file_btn_layout.setContentsMargins(0, 0, 0, 0)
@@ -412,20 +551,32 @@ class MainWindow(QMainWindow):
         self.btn_remove_selected = QPushButton("移除选中")
         self.btn_clear_files = QPushButton("清空列表")
         self.btn_media_info = QPushButton("📽️ 查看媒体信息")
+        self.btn_scan_overhead = QPushButton("🔍 扫描冗余度")
 
         for btn in [self.btn_add_files, self.btn_add_folder,
                     self.btn_remove_selected, self.btn_clear_files,
-                    self.btn_media_info]:
+                    self.btn_media_info, self.btn_scan_overhead]:
             btn.setFixedHeight(BUTTON_HEIGHT)
             file_btn_layout.addWidget(btn)
 
-        # 列表高度 = 5 个按钮 + 4 个间距
-        list_height = BUTTON_HEIGHT * 5 + BUTTON_GAP * 4
+        # 核心：计算 6 个按钮的总高度
+        list_height = BUTTON_HEIGHT * 6 + BUTTON_GAP * 5
+        
+        # 核心：将列表框的高度严格固定为和按钮组一样高
         self.file_list.setFixedHeight(list_height)
-
+        
+        # 将列表和按钮组加入水平布局
         file_layout.addWidget(self.file_list)
         file_layout.addLayout(file_btn_layout)
+        
+        # 关键修复：移除 addLayout 的 alignment 参数，直接设置布局本身的对齐
+        # 让内部的控件保持顶部对齐
+        file_layout.setAlignment(Qt.AlignTop)
+        
         file_group.setLayout(file_layout)
+
+        # 关键：强制 QGroupBox 的高度只适应内容，不随窗口纵向拉伸
+        file_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
         # --- 2. 操作模式与参数区（全部水平排一行） ---
         param_group = QGroupBox("2. 操作模式与参数")
@@ -443,6 +594,7 @@ class MainWindow(QMainWindow):
                 "将字幕封装进视频 (无编码)",
                 "提取视频中的音频 (无编码)",
                 "修复视频索引 (无编码 Remux)",
+                "极简压缩 (H.265, CRF23)",
                 "视频转码为 MP4 (H.264)",
             ]
         )
@@ -457,7 +609,6 @@ class MainWindow(QMainWindow):
         self.edit_start.setText("00:00:00")
         self.edit_start.setFixedWidth(110)
         self.edit_start.setFixedHeight(PARAM_H)
-
         self.check_end = QCheckBox("到")
         self.check_end.setFixedHeight(PARAM_H)
         self.edit_end = QLineEdit()
@@ -465,6 +616,9 @@ class MainWindow(QMainWindow):
         self.edit_end.setText("00:00:00")
         self.edit_end.setFixedWidth(110)
         self.edit_end.setFixedHeight(PARAM_H)
+        # 智能音频控制开关（仅在极简压缩中显示）
+        self.check_smart_audio = QCheckBox("智能音频控制 (源>192k则重编码)")
+        self.check_smart_audio.setFixedHeight(PARAM_H)
 
         # 字幕参数
         self.lbl_sub = QLabel("字幕文件:")
@@ -484,6 +638,7 @@ class MainWindow(QMainWindow):
         param_layout.addWidget(self.lbl_sub)
         param_layout.addWidget(self.edit_sub, stretch=1)
         param_layout.addWidget(self.btn_select_sub)
+        param_layout.addWidget(self.check_smart_audio)
         param_layout.addStretch()
 
         param_group.setLayout(param_layout)
@@ -549,7 +704,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(file_group, stretch=0)
         main_layout.addWidget(param_group, stretch=0)
         main_layout.addWidget(out_group, stretch=0)
-        main_layout.addWidget(run_group, stretch=5)
+        main_layout.addWidget(run_group, stretch=1)
 
         # --- 信号连接 ---
         self.btn_add_files.clicked.connect(self.add_files)
@@ -566,6 +721,7 @@ class MainWindow(QMainWindow):
         self.btn_add_folder.clicked.connect(self.add_folder)
         self.file_list.files_dropped.connect(self._on_files_dropped)
         self.edit_sub.file_dropped.connect(self._on_subtitle_dropped)
+        self.btn_scan_overhead.clicked.connect(self.scan_overhead)
 
         # 初始更新参数显示
         self.update_mode_params(0)
@@ -591,13 +747,8 @@ class MainWindow(QMainWindow):
 
         # 隐藏所有动态参数
         for w in [
-            self.check_start,
-            self.edit_start,
-            self.check_end,
-            self.edit_end,
-            self.lbl_sub,
-            self.edit_sub,
-            self.btn_select_sub,
+            self.check_start, self.edit_start, self.check_end, self.edit_end,
+            self.lbl_sub, self.edit_sub, self.btn_select_sub, self.check_smart_audio
         ]:
             w.hide()
 
@@ -610,6 +761,8 @@ class MainWindow(QMainWindow):
             self.lbl_sub.show()
             self.edit_sub.show()
             self.btn_select_sub.show()
+        elif "极简压缩" in mode:      # ← 新增
+            self.check_smart_audio.show()
 
     def add_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -897,6 +1050,22 @@ class MainWindow(QMainWindow):
                     cmd.extend(["-movflags", "+faststart"])
                 cmd.append(output_file)
 
+            elif "极简压缩" in mode:
+                cmd.extend([
+                    "-i", input_file,
+                    "-c:v", "libx265",
+                    "-crf", "23",
+                    "-tag:v", "hvc1",
+                ])
+                
+                if self.check_smart_audio.isChecked():
+                    # 留个标记，让后台 Worker 在真正执行前去探测源音频并替换
+                    cmd.append("__SMART_AUDIO__")
+                else:
+                    cmd.extend(["-c:a", "copy"])
+                
+                cmd.append(output_file)
+
             elif "视频转码" in mode:
                 cmd.extend(["-i", input_file, "-c:v", "libx264", "-c:a", "aac", output_file])
 
@@ -985,9 +1154,45 @@ class MainWindow(QMainWindow):
 
         QMessageBox.warning(self, "提示", "请先添加文件或指定输出目录")
 
+    def scan_overhead(self):
+        """扫描列表文件的冗余度"""
+        if self.file_list.count() == 0:
+            QMessageBox.warning(self, "提示", "列表中没有文件，请先添加")
+            return
+
+        if hasattr(self, "_overhead_worker") and self._overhead_worker is not None:
+            if self._overhead_worker.isRunning():
+                QMessageBox.information(self, "提示", "扫描正在进行中，请稍候...")
+                return
+
+        # 如果有选中项则只扫选中项，否则扫描整个列表
+        selected = self.file_list.selectedItems()
+        if selected:
+            files = [item.text() for item in selected]
+        else:
+            files = [self.file_list.item(i).text() for i in range(self.file_list.count())]
+
+        self.btn_scan_overhead.setEnabled(False)
+        self.log_text.append("\n⏳ 正在扫描文件冗余度，请稍候...")
+
+        self._overhead_worker = OverheadScannerWorker(self.ffprobe_path, files)
+        self._overhead_worker.log_signal.connect(self.append_log)
+        self._overhead_worker.finished_signal.connect(self._on_overhead_finished)
+        self._overhead_worker.start()
+
+    def _on_overhead_finished(self):
+        self.btn_scan_overhead.setEnabled(True)
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyleSheet(GLOBAL_QSS)   # ← 应用全局样式
+    
+    # 使用 resource_path 获取正确路径，并且给主窗口也设置一次图标
+    from PyQt5.QtGui import QIcon
+    icon_path = resource_path("app.ico")
+    app.setWindowIcon(QIcon(icon_path))
+    
+    app.setStyleSheet(GLOBAL_QSS)
     window = MainWindow()
+    window.setWindowIcon(QIcon(icon_path))  # 给窗口单独设置一次
     window.show()
     sys.exit(app.exec_())
