@@ -1181,37 +1181,60 @@ class MainWindow(QMainWindow):
                 
                 # 视频编码器与参数映射
                 if self.check_nvenc.isChecked():
-                    # N卡 H.265: 使用 cq 和 vbr 模式
-                    cmd.extend(["-c:v", "hevc_nvenc", "-preset", "p4", "-cq", crf_val, "-rc", "vbr", "-tag:v", "hvc1"])
+                    # N卡 H.265: 使用 cq、vbr，并且必须加 -b:v 0 解除码率上限
+                    cmd.extend([
+                        "-c:v", "hevc_nvenc", "-preset", "p4", 
+                        "-rc", "vbr", "-cq", crf_val, "-b:v", "0", 
+                        "-pix_fmt", "yuv420p", "-tag:v", "hvc1"
+                    ])
                 elif self.check_qsv.isChecked():
-                    # Intel H.265: 使用 global_quality
-                    cmd.extend(["-c:v", "hevc_qsv", "-global_quality", crf_val, "-tag:v", "hvc1"])
+                    # Intel 核显 H.265: 使用 global_quality，同样需要 -b:v 0
+                    cmd.extend([
+                        "-c:v", "hevc_qsv", "-preset", "medium", 
+                        "-global_quality", crf_val, "-b:v", "0", 
+                        "-pix_fmt", "yuv420p", "-tag:v", "hvc1"
+                    ])
                 else:
-                    # CPU 纯软编
-                    cmd.extend(["-c:v", "libx265", "-crf", crf_val, "-tag:v", "hvc1"])
+                    # CPU 纯软编: 加上 x265-params 防止底层日志刷屏
+                    cmd.extend([
+                        "-c:v", "libx265", "-preset", "medium", "-crf", crf_val,
+                        "-x265-params", "log-level=error",
+                        "-pix_fmt", "yuv420p", "-tag:v", "hvc1"
+                    ])
                 
                 # 智能音频控制
                 if self.check_smart_audio.isChecked():
-                    # 留个标记，让后台 Worker 在真正执行前去探测源音频并替换
                     cmd.append("__SMART_AUDIO__")
                 else:
                     cmd.extend(["-c:a", "copy"])
                 
-                cmd.append(output_file)
+                # 添加 faststart 加快移动端/网页加载
+                cmd.extend(["-movflags", "+faststart", output_file])
 
             elif "视频转码" in mode:
                 cmd.extend(["-i", input_file])
                 
                 # 视频编码器与参数映射 (H.264)
                 if self.check_nvenc.isChecked():
-                    cmd.extend(["-c:v", "h264_nvenc", "-preset", "p4", "-cq", crf_val])
+                    cmd.extend([
+                        "-c:v", "h264_nvenc", "-preset", "p4", 
+                        "-rc", "vbr", "-cq", crf_val, "-b:v", "0",
+                        "-pix_fmt", "yuv420p"
+                    ])
                 elif self.check_qsv.isChecked():
-                    cmd.extend(["-c:v", "h264_qsv", "-global_quality", crf_val])
+                    cmd.extend([
+                        "-c:v", "h264_qsv", "-preset", "medium", 
+                        "-global_quality", crf_val, "-b:v", "0",
+                        "-pix_fmt", "yuv420p"
+                    ])
                 else:
-                    cmd.extend(["-c:v", "libx264", "-crf", crf_val])
+                    cmd.extend([
+                        "-c:v", "libx264", "-preset", "medium", "-crf", crf_val,
+                        "-pix_fmt", "yuv420p"
+                    ])
                 
-                # 音频固定转码为 AAC
-                cmd.extend(["-c:a", "aac", output_file])
+                # 音频固定转码为 AAC，并添加 faststart
+                cmd.extend(["-c:a", "aac", "-movflags", "+faststart", output_file])
 
             tasks.append((cmd, output_file))
 
