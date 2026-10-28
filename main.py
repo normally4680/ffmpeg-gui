@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import json
 import time
+import psutil
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -181,27 +182,53 @@ class FFmpegWorker(QThread):
     def __init__(self, tasks):
         super().__init__()
         self.tasks = tasks  # 包含 (cmd, output_file) 的列表
+        self.process = None
+        self.is_paused = False
+        self.is_stopped = False
+
+    def pause_process(self):
+        if self.process and not self.is_stopped:
+            try:
+                psutil.Process(self.process.pid).suspend()
+                self.is_paused = True
+            except Exception as e:
+                self.log_signal.emit(f"⚠️ 暂停失败: {e}")
+
+    def resume_process(self):
+        if self.process and not self.is_stopped and self.is_paused:
+            try:
+                psutil.Process(self.process.pid).resume()
+                self.is_paused = False
+            except Exception as e:
+                self.log_signal.emit(f"⚠️ 恢复失败: {e}")
+
+    def stop_process(self):
+        self.is_stopped = True
+        if self.process:
+            try:
+                if self.is_paused:
+                    psutil.Process(self.process.pid).resume()
+                self.process.terminate()
+            except Exception:
+                pass
 
     def run(self):
         total = len(self.tasks)
         for idx, (cmd, output_file) in enumerate(self.tasks):
+            if self.is_stopped:
+                break
+
             self.log_signal.emit(f"\n[{idx+1}/{total}] 开始处理: {os.path.basename(output_file)}")
             
             try:
-                # Windows下隐藏黑框
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 startupinfo.wShowWindow = subprocess.SW_HIDE
 
-                # ============ 重构：更安全的智能音频占位符替换 ============
+                # 智能音频占位符处理 (原有逻辑)
                 if "__SMART_AUDIO__" in cmd:
                     cmd.remove("__SMART_AUDIO__")
-                    
-                    # 用更安全的方式获取输入文件
-                    input_file = ""
-                    if "-i" in cmd:
-                        input_file = cmd[cmd.index("-i") + 1]
-                    
+                    input_file = cmd[cmd.index("-i") + 1] if "-i" in cmd else ""
                     audio_params = []
                     if input_file:
                         audio_bitrate = self.get_audio_bitrate(input_file)
@@ -213,31 +240,25 @@ class FFmpegWorker(QThread):
                             audio_params = ["-c:a", "copy"]
                     else:
                         audio_params = ["-c:a", "copy"]
-                    
-                    # 安全重组命令：取出输出文件，添加音频参数，再把输出文件放回最后
                     out_file = cmd[-1]
-                    cmd = cmd[:-1]
-                    cmd.extend(audio_params)
-                    cmd.append(out_file)
-                # ==============================================================
+                    cmd = cmd[:-1] + audio_params + [out_file]
 
-                # 打印最终命令
                 self.log_signal.emit(f"💻 执行命令: {subprocess.list2cmdline(cmd)}")
 
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    encoding="utf-8",
-                    errors="ignore",
-                    startupinfo=startupinfo,
+                self.process = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    encoding="utf-8", errors="ignore", startupinfo=startupinfo,
                 )
+                self.is_paused = False
 
                 last_emit = 0
                 last_line = ""
-                # 核心修复：无论读取日志发生什么异常，必须确保进程被等待
                 try:
-                    for line in process.stdout:
+                    for line in self.process.stdout:
+                        # 如果中途被强制停止，直接跳出读取循环
+                        if self.is_stopped:
+                            break
+                        
                         line = line.strip()
                         if not line:
                             continue
@@ -257,24 +278,32 @@ class FFmpegWorker(QThread):
                 except Exception as read_err:
                     self.log_signal.emit(f"⚠️ 读取日志时发生中断: {read_err}")
                 finally:
-                    # 无论中间发生什么，绝对保证等待进程结束
-                    process.wait()
-                    if process.stdout:
-                        process.stdout.close()
+                    self.process.wait()
+                    if self.process.stdout:
+                        self.process.stdout.close()
+                    self.process = None
+
+                # 如果用户点击了停止，处理半成品文件
+                if self.is_stopped:
+                    if os.path.exists(output_file):
+                        try: os.remove(output_file)
+                        except: pass
+                    self.log_signal.emit(f"⏹ 任务被终止，已清理半成品: {os.path.basename(output_file)}")
+                    break
 
                 if last_line:
                     self.log_signal.emit(last_line)
 
-                if process.returncode == 0:
+                if self.process.returncode == 0:
                     self.log_signal.emit(f"✅ 成功: {os.path.basename(output_file)}")
                 else:
-                    self.log_signal.emit(f"❌ 失败 (返回码 {process.returncode}): {os.path.basename(output_file)}")
+                    self.log_signal.emit(f"❌ 失败 (返回码 {self.process.returncode})")
 
             except Exception as e:
                 self.log_signal.emit(f"❌ 发生严重异常: {str(e)}")
 
             self.progress_signal.emit(idx + 1, total)
-
+        
         self.finished_signal.emit()
 
     def get_audio_bitrate(self, file_path):
@@ -737,16 +766,31 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
 
         self.btn_run = QPushButton("开始批量处理")
-        self.btn_run.setStyleSheet("font-weight: bold; background-color: #4CAF50; color: white;")
+        self.btn_run.setStyleSheet(
+            "font-weight: bold; background-color: #4CAF50; color: white;"
+        )
         self.btn_run.setFixedHeight(40)
+
+        # --- 新增：暂停和停止按钮 ---
+        self.btn_pause = QPushButton("⏸ 暂停")
+        self.btn_pause.setFixedHeight(40)
+        self.btn_pause.setEnabled(False)  # 初始禁用
+
+        self.btn_stop = QPushButton("⏹ 停止")
+        self.btn_stop.setFixedHeight(40)
+        self.btn_stop.setStyleSheet("background-color: #f44336; color: white;") # 红色警示
+        self.btn_stop.setEnabled(False)
+        # ---------------------------
 
         self.btn_open_out = QPushButton("📂 打开输出文件夹")
         self.btn_open_out.setFixedHeight(40)
 
-        # 两个按钮同一行各占一半
+        # 四个按钮同一行
         btn_row = QHBoxLayout()
-        btn_row.addWidget(self.btn_run, stretch=1)
-        btn_row.addWidget(self.btn_open_out, stretch=1)
+        btn_row.addWidget(self.btn_run, stretch=2)
+        btn_row.addWidget(self.btn_pause, stretch=1)
+        btn_row.addWidget(self.btn_stop, stretch=1)
+        btn_row.addWidget(self.btn_open_out, stretch=2)
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
@@ -780,6 +824,8 @@ class MainWindow(QMainWindow):
         self.file_list.files_dropped.connect(self._on_files_dropped)
         self.edit_sub.file_dropped.connect(self._on_subtitle_dropped)
         self.btn_scan_overhead.clicked.connect(self.scan_overhead)
+        self.btn_pause.clicked.connect(self.toggle_pause)
+        self.btn_stop.clicked.connect(self.stop_processing)
         # 硬件加速互斥逻辑
         self.check_nvenc.stateChanged.connect(self.on_nvenc_toggled)
         self.check_qsv.stateChanged.connect(self.on_qsv_toggled)
@@ -1249,13 +1295,15 @@ class MainWindow(QMainWindow):
         if not tasks:
             return
 
-        # 禁用按钮，防止重复点击
         self.btn_run.setEnabled(False)
+        self.btn_pause.setEnabled(True)
+        self.btn_pause.setText("⏸ 暂停")
+        self.btn_stop.setEnabled(True)
+        
         self.progress_bar.setValue(0)
         self.log_text.clear()
         self.log_text.append(f"准备处理 {len(tasks)} 个文件...\n")
 
-        # 启动线程
         self.worker = FFmpegWorker(tasks)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.log_signal.connect(self.append_log)
@@ -1284,21 +1332,39 @@ class MainWindow(QMainWindow):
     def processing_finished(self):
         self.log_text.append("\n🎉 所有任务处理完成！")
         self.btn_run.setEnabled(True)
-
-        # 构造带“打开输出文件夹”按钮的完成提示
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setText("⏸ 暂停")
+        self.btn_stop.setEnabled(False)
+        
+        # 弹窗逻辑保持你原来的
         msg = QMessageBox(self)
         msg.setWindowTitle("完成")
         msg.setIcon(QMessageBox.Information)
-        msg.setText("批量处理已全部完成！")
+        msg.setText("批量处理已结束！")
         msg.setInformativeText("是否需要打开输出文件夹？")
-
         btn_open = msg.addButton("📂 打开输出文件夹", QMessageBox.AcceptRole)
         msg.addButton("关闭", QMessageBox.RejectRole)
-
         msg.exec_()
-
         if msg.clickedButton() == btn_open:
             self.open_output_folder()
+
+    def toggle_pause(self):
+        if hasattr(self, "worker") and self.worker.isRunning():
+            if self.worker.is_paused:
+                self.worker.resume_process()
+                self.btn_pause.setText("⏸ 暂停")
+                self.log_text.append("▶️ 任务已继续")
+            else:
+                self.worker.pause_process()
+                self.btn_pause.setText("▶️ 继续")
+                self.log_text.append("⏸ 任务已暂停")
+
+    def stop_processing(self):
+        if hasattr(self, "worker") and self.worker.isRunning():
+            self.worker.stop_process()
+            self.btn_pause.setEnabled(False)
+            self.btn_stop.setEnabled(False)
+            self.log_text.append("⏹ 正在停止当前任务并清理半成品...")
 
     def open_output_folder(self):
         """打开输出文件夹"""
