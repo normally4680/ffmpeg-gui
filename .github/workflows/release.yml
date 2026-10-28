@@ -33,7 +33,7 @@ jobs:
       # ==============================
       - name: 打包 - 单文件版 (Onefile)
         run: |
-          pyinstaller -F -w --icon=app.ico --add-data "app.ico;." --name ffmpeg-gui-single main.py
+          pyinstaller -F -w --icon=app.ico --add-data "app.ico;." --name ffmpeg-gui main.py
           copy README.md dist\
           copy LICENSE dist\
 
@@ -42,7 +42,7 @@ jobs:
       # ==============================
       - name: 打包 - 文件夹版 (Onedir)
         run: |
-          pyinstaller -w --icon=app.ico --add-data "app.ico;." --name ffmpeg-gui-folder main.py
+          pyinstaller -w --icon=app.ico --add-data "app.ico;." --name ffmpeg-gui main.py
           copy README.md dist\ffmpeg-gui-folder\
           copy LICENSE dist\ffmpeg-gui-folder\
 

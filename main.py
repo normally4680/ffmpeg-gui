@@ -278,10 +278,11 @@ class FFmpegWorker(QThread):
                 except Exception as read_err:
                     self.log_signal.emit(f"⚠️ 读取日志时发生中断: {read_err}")
                 finally:
-                    self.process.wait()
-                    if self.process.stdout:
-                        self.process.stdout.close()
-                    self.process = None
+                    # 安全地等待并关闭
+                    if self.process:
+                        self.process.wait()
+                        if self.process.stdout:
+                            self.process.stdout.close()
 
                 # 如果用户点击了停止，处理半成品文件
                 if self.is_stopped:
@@ -289,18 +290,26 @@ class FFmpegWorker(QThread):
                         try: os.remove(output_file)
                         except: pass
                     self.log_signal.emit(f"⏹ 任务被终止，已清理半成品: {os.path.basename(output_file)}")
+                    self.process = None
                     break
 
                 if last_line:
                     self.log_signal.emit(last_line)
 
-                if self.process.returncode == 0:
-                    self.log_signal.emit(f"✅ 成功: {os.path.basename(output_file)}")
-                else:
-                    self.log_signal.emit(f"❌ 失败 (返回码 {self.process.returncode})")
+                # 核心修复：在置空 self.process 之前，先获取 returncode
+                if self.process:
+                    return_code = self.process.returncode
+                    if return_code == 0:
+                        self.log_signal.emit(f"✅ 成功: {os.path.basename(output_file)}")
+                    else:
+                        self.log_signal.emit(f"❌ 失败 (返回码 {return_code})")
+                    # 到这里当前任务处理完毕，再安全置空
+                    self.process = None
 
             except Exception as e:
                 self.log_signal.emit(f"❌ 发生严重异常: {str(e)}")
+                # 防止异常导致 self.process 没被释放
+                self.process = None
 
             self.progress_signal.emit(idx + 1, total)
         
