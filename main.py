@@ -27,6 +27,8 @@ from PyQt5.QtWidgets import (
     QSplitter,
     QSizePolicy,
     QSpinBox,
+    QDialog,
+    QScrollArea,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon
@@ -84,12 +86,97 @@ QProgressBar {
 # ==========================================
 # 支持拖拽的控件
 # ==========================================
-MEDIA_EXTS = {
+VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".webm",
     ".m4v", ".wmv", ".mpg", ".mpeg", ".rmvb",
+}
+AUDIO_EXTS = {
     ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma",
 }
+MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS
 SUB_EXTS = {".srt", ".ass", ".vtt", ".ssa", ".sub"}
+
+# 各输出容器能承载的字幕编码器（查不到即表示该容器不支持文字字幕）
+SUB_CODEC_BY_EXT = {
+    ".mp4": "mov_text",
+    ".m4v": "mov_text",
+    ".mov": "mov_text",
+    ".mkv": "copy",        # 保留 ASS/SSA 特效、字体与定位
+    ".webm": "webvtt",
+}
+
+# 位图字幕：只能 copy 进 MKV，无法转成文字字幕
+BITMAP_SUB_EXTS = {".sub", ".sup", ".idx"}
+
+# 轨道管理用：各容器允许原样复制的字幕编码（None 表示全部支持）
+CONTAINER_SUB_CODECS = {
+    ".mp4": {"mov_text"},
+    ".m4v": {"mov_text"},
+    ".mov": {"mov_text"},
+    ".mkv": None,
+    ".webm": {"webvtt"},
+}
+
+
+def subtitle_codec_allowed(container_ext, codec):
+    """判断某个字幕编码能否原样复制进指定容器"""
+    if container_ext not in CONTAINER_SUB_CODECS:
+        return False
+    allowed = CONTAINER_SUB_CODECS[container_ext]
+    return True if allowed is None else codec in allowed
+
+
+def build_ext_filter(name, exts):
+    """把扩展名集合转换成 QFileDialog 可用的过滤器字符串"""
+    return "{} ({})".format(name, " ".join("*" + ext for ext in sorted(exts)))
+
+
+# Windows 进程异常终止码（NTSTATUS）：说明进程被系统直接终止，而非 ffmpeg 逻辑报错
+NTSTATUS_HINTS = {
+    3221225477: "进程崩溃：访问冲突，常见于内存或驱动异常",
+    3221225501: "进程崩溃：非法指令，通常是编码器指令集或 CPU 稳定性问题",
+    3221225725: "进程崩溃：栈溢出",
+    3221226505: "进程崩溃：栈缓冲区越界",
+    3221225786: "进程被外部中断",
+}
+
+# ffmpeg 在 Windows 下常把负的 AVERROR(errno) 当退出码，按无符号 32 位呈现
+ERRNO_HINTS = {
+    -2: "找不到文件或路径（ENOENT），请检查文件是否被移动/删除",
+    -5: "读写出错（EIO），可能是磁盘问题或文件损坏",
+    -13: "没有访问权限（EACCES）",
+    -22: "参数无效（EINVAL），请检查输入文件或命令参数",
+    -28: "磁盘空间不足（ENOSPC）",
+}
+
+
+def describe_return_code(code):
+    """把 ffmpeg 返回码翻译成可读说明"""
+    if code is None:
+        return "未取得返回码"
+
+    # 0) 非 Windows 平台被信号强制结束时为负数
+    if code < 0:
+        return "{}（进程被信号 {} 终止）".format(code, -code)
+
+    # 1) 系统级异常终止（崩溃）
+    if 0xC0000000 <= code <= 0xC0000FFF:
+        hint = NTSTATUS_HINTS.get(code, "进程被系统异常终止")
+        return "{}（0x{:08X}：{}）".format(code, code, hint)
+
+    # 2) 负 errno / 负的 AVERROR 被当成无符号数
+    if code >= 0x80000000:
+        signed = code - 0x100000000
+        hint = ERRNO_HINTS.get(signed, "FFmpeg 内部错误码")
+        return "{}（0x{:08X}，即 {}：{}）".format(code, code, signed, hint)
+
+    # 3) 普通退出码
+    if code == 1:
+        return "1（FFmpeg 执行失败：参数、编码或输入文件问题）"
+    return "{}（0x{:08X}）".format(code, code)
+
+
+
 
 
 class DropListWidget(QListWidget):
@@ -177,7 +264,7 @@ class DropSubtitleEdit(QLineEdit):
 class FFmpegWorker(QThread):
     progress_signal = pyqtSignal(int, int)  # 当前进度, 总数
     log_signal = pyqtSignal(str)  # 日志输出
-    finished_signal = pyqtSignal()  # 完成信号
+    finished_signal = pyqtSignal(list)  # 完成信号，携带每个任务的执行结果
 
     def __init__(self, tasks):
         super().__init__()
@@ -185,6 +272,7 @@ class FFmpegWorker(QThread):
         self.process = None
         self.is_paused = False
         self.is_stopped = False
+        self.results = []   # 每个任务的执行台账
 
     def pause_process(self):
         if self.process and not self.is_stopped:
@@ -214,12 +302,23 @@ class FFmpegWorker(QThread):
 
     def run(self):
         total = len(self.tasks)
+        self.results = []
         for idx, (cmd, output_file) in enumerate(self.tasks):
             if self.is_stopped:
                 break
 
             self.log_signal.emit(f"\n[{idx+1}/{total}] 开始处理: {os.path.basename(output_file)}")
-            
+
+            # 本任务执行台账：成功/失败、返回码、是否留下半成品
+            record = {
+                "output": output_file,
+                "code": None,
+                "ok": False,
+                "stopped": False,
+                "error": "",
+                "partial": False,
+            }
+
             try:
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -290,6 +389,9 @@ class FFmpegWorker(QThread):
                         try: os.remove(output_file)
                         except: pass
                     self.log_signal.emit(f"⏹ 任务被终止，已清理半成品: {os.path.basename(output_file)}")
+                    record["stopped"] = True
+                    record["error"] = "任务被手动停止"
+                    self.results.append(record)
                     self.process = None
                     break
 
@@ -299,21 +401,29 @@ class FFmpegWorker(QThread):
                 # 核心修复：在置空 self.process 之前，先获取 returncode
                 if self.process:
                     return_code = self.process.returncode
+                    record["code"] = return_code
+                    record["ok"] = (return_code == 0)
                     if return_code == 0:
                         self.log_signal.emit(f"✅ 成功: {os.path.basename(output_file)}")
                     else:
-                        self.log_signal.emit(f"❌ 失败 (返回码 {return_code})")
+                        record["partial"] = os.path.exists(output_file)
+                        self.log_signal.emit(
+                            f"❌ 失败: {os.path.basename(output_file)} "
+                            f"返回码 {describe_return_code(return_code)}"
+                        )
                     # 到这里当前任务处理完毕，再安全置空
                     self.process = None
 
             except Exception as e:
+                record["error"] = str(e)
                 self.log_signal.emit(f"❌ 发生严重异常: {str(e)}")
                 # 防止异常导致 self.process 没被释放
                 self.process = None
 
+            self.results.append(record)
             self.progress_signal.emit(idx + 1, total)
-        
-        self.finished_signal.emit()
+
+        self.finished_signal.emit(self.results)
 
     def get_audio_bitrate(self, file_path):
         """获取第一条音频流的码率(bps)，失败返回0"""
@@ -580,6 +690,338 @@ class OverheadScannerWorker(QThread):
         self.log_signal.emit("=" * 60 + "\n")
         self.finished_signal.emit()
 
+class TrackProbeWorker(QThread):
+    """后台读取单个文件的轨道列表（视频/音频/字幕/附件）"""
+    result_signal = pyqtSignal(dict)
+
+    def __init__(self, ffprobe_path, file_path):
+        super().__init__()
+        self.ffprobe_path = ffprobe_path
+        self.file_path = file_path
+
+    def run(self):
+        if not self.ffprobe_path:
+            self.result_signal.emit({"error": "未找到 ffprobe，无法读取轨道信息"})
+            return
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+
+            cmd = [
+                self.ffprobe_path, "-v", "error",
+                "-print_format", "json",
+                "-show_streams", "-show_format",
+                self.file_path,
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="ignore", check=True,
+                timeout=20, startupinfo=startupinfo,
+            )
+            self.result_signal.emit(self._parse(json.loads(result.stdout)))
+        except Exception as e:
+            self.result_signal.emit({"error": str(e)})
+
+    def _parse(self, data):
+        tracks = []
+        counters = {}
+        for s in data.get("streams", []):
+            kind = s.get("codec_type", "")
+            if kind not in ("video", "audio", "subtitle", "attachment"):
+                continue
+
+            disp = s.get("disposition", {}) or {}
+            # 封面图在 mp4 里是 video 流，归到附件，避免显示成"第二条视频轨"
+            if kind == "video" and disp.get("attached_pic"):
+                kind = "attachment"
+
+            counters[kind] = counters.get(kind, 0) + 1
+            tags = s.get("tags", {}) or {}
+            tracks.append({
+                "index": s.get("index", -1),
+                "kind": kind,
+                "ordinal": counters[kind],
+                "codec": s.get("codec_name", "未知"),
+                "lang": (tags.get("language") or "").strip(),
+                "title": (tags.get("title") or "").strip(),
+                "channels": s.get("channels", 0),
+                "sample_rate": s.get("sample_rate", ""),
+                "bitrate": self._kbps(s.get("bit_rate")),
+                "width": s.get("width", 0),
+                "height": s.get("height", 0),
+                "fps": self._fps(s.get("r_frame_rate")),
+                "default": bool(disp.get("default", 0)),
+                "forced": bool(disp.get("forced", 0)),
+            })
+
+        fmt = data.get("format", {}) or {}
+        return {
+            "path": self.file_path,
+            "tracks": tracks,
+            "format": fmt,
+            "error": "",
+        }
+
+    @staticmethod
+    def _kbps(value):
+        try:
+            v = int(float(value))
+            return f"{v // 1000} kbps" if v > 0 else ""
+        except (TypeError, ValueError):
+            return ""
+
+    @staticmethod
+    def _fps(value):
+        try:
+            num, den = str(value).split("/")
+            fps = float(num) / float(den)
+            return f"{fps:.0f} fps" if fps > 0 else ""
+        except (ValueError, ZeroDivisionError, AttributeError):
+            return ""
+
+
+class TrackDialog(QDialog):
+    """轨道管理：勾选要保留的音轨/字幕轨，确定后由主窗口执行无编码重封装"""
+
+    def __init__(self, parent=None, file_path="", ffprobe_path=None):
+        super().__init__(parent)
+        self.setWindowTitle("轨道管理")
+        self.resize(720, 540)
+        self.setMinimumSize(620, 420)
+
+        self.file_path = file_path
+        self.ffprobe_path = ffprobe_path
+        self.ext = os.path.splitext(file_path)[1].lower()
+        self.plan = None          # 确定后写回主窗口
+        self.info = None
+        self.checks = {}          # 绝对流索引 -> (QCheckBox, track)
+        self._worker = None
+
+        outer = QVBoxLayout(self)
+        outer.setSpacing(8)
+
+        self.lbl_title = QLabel(f"文件：{os.path.basename(file_path)}")
+        self.lbl_title.setStyleSheet("font-weight: bold;")
+        outer.addWidget(self.lbl_title)
+
+        self.lbl_meta = QLabel("正在读取轨道信息…")
+        self.lbl_meta.setStyleSheet("color: #666;")
+        outer.addWidget(self.lbl_meta)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.inner = QWidget()
+        self.tracks_layout = QVBoxLayout(self.inner)
+        self.tracks_layout.setSpacing(8)
+        self.scroll.setWidget(self.inner)
+        outer.addWidget(self.scroll, 1)
+
+        self.lbl_hint = QLabel(
+            "勾选 = 保留，取消 = 删除。全程 -c copy，不重新编码，画面与原片完全一致。"
+        )
+        self.lbl_hint.setStyleSheet("color: #666;")
+        outer.addWidget(self.lbl_hint)
+
+        btn_row = QHBoxLayout()
+        self.btn_all = QPushButton("全选")
+        self.btn_none = QPushButton("全不选")
+        self.btn_ok = QPushButton("确定")
+        self.btn_ok.setEnabled(False)
+        self.btn_cancel = QPushButton("取消")
+        btn_row.addWidget(self.btn_all)
+        btn_row.addWidget(self.btn_none)
+        btn_row.addStretch()
+        btn_row.addWidget(self.btn_cancel)
+        btn_row.addWidget(self.btn_ok)
+        outer.addLayout(btn_row)
+
+        self.btn_all.clicked.connect(lambda: self._set_all(True))
+        self.btn_none.clicked.connect(lambda: self._set_all(False))
+        self.btn_ok.clicked.connect(self._on_ok)
+        self.btn_cancel.clicked.connect(self.reject)
+
+        self._start_probe()
+
+    def _start_probe(self):
+        self._worker = TrackProbeWorker(self.ffprobe_path, self.file_path)
+        self._worker.result_signal.connect(self._on_probed)
+        self._worker.start()
+
+    def _on_probed(self, info):
+        self.info = info
+        if info.get("error"):
+            self.lbl_meta.setText(f"❌ 读取失败：{info['error']}")
+            return
+
+        self.lbl_meta.setText(self._meta_text(info))
+        self._build_rows(info)
+        self.btn_ok.setEnabled(True)
+
+    def _meta_text(self, info):
+        fmt = info.get("format", {}) or {}
+        try:
+            total = int(float(fmt.get("duration", 0) or 0))
+            duration = f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
+        except (TypeError, ValueError):
+            duration = "未知时长"
+
+        counts = {}
+        for t in info.get("tracks", []):
+            counts[t["kind"]] = counts.get(t["kind"], 0) + 1
+
+        parts = [self.ext.lstrip(".").upper() or "未知容器", duration]
+        if counts.get("video"):
+            parts.append(f"视频 {counts['video']} 条")
+        if counts.get("audio"):
+            parts.append(f"音频 {counts['audio']} 条")
+        if counts.get("subtitle"):
+            parts.append(f"字幕 {counts['subtitle']} 条")
+        if counts.get("attachment"):
+            parts.append(f"附件 {counts['attachment']} 个")
+        return " · ".join(parts) + "　（索引按文件内流序号）"
+
+    def _build_rows(self, info):
+        tracks = info.get("tracks", [])
+
+        video = [t for t in tracks if t["kind"] == "video"]
+        if video:
+            box = QGroupBox(f"视频轨（{len(video)} 条，不可删除）")
+            lay = QVBoxLayout(box)
+            for t in video:
+                lay.addWidget(QLabel(self._row_text(t, "V")))
+            for i in range(lay.count()):
+                lay.itemAt(i).widget().setStyleSheet("color: #888;")
+            self.tracks_layout.addWidget(box)
+
+        audio = [t for t in tracks if t["kind"] == "audio"]
+        box = QGroupBox(f"音频轨（{len(audio)} 条）")
+        lay = QVBoxLayout(box)
+        if not audio:
+            empty = QLabel("此文件没有音频轨")
+            empty.setStyleSheet("color: #888;")
+            lay.addWidget(empty)
+        for t in audio:
+            cb = QCheckBox(self._row_text(t, "A"))
+            cb.setChecked(True)
+            lay.addWidget(cb)
+            self.checks[t["index"]] = (cb, t)
+        self.tracks_layout.addWidget(box)
+
+        subs = [t for t in tracks if t["kind"] == "subtitle"]
+        box = QGroupBox(f"字幕轨（{len(subs)} 条）")
+        lay = QVBoxLayout(box)
+        if not subs:
+            empty = QLabel("此文件没有字幕轨")
+            empty.setStyleSheet("color: #888;")
+            lay.addWidget(empty)
+        for t in subs:
+            cb = QCheckBox(self._row_text(t, "S"))
+            if subtitle_codec_allowed(self.ext, t["codec"]):
+                cb.setChecked(True)
+            else:
+                # 容器装不下这种字幕编码，只能删除，避免执行时报错
+                cb.setChecked(False)
+                cb.setEnabled(False)
+                cb.setText(cb.text() + "　—— 当前容器不支持该编码，只能删除")
+                cb.setStyleSheet("color: #999;")
+            lay.addWidget(cb)
+            self.checks[t["index"]] = (cb, t)
+        self.tracks_layout.addWidget(box)
+
+        attachments = [t for t in tracks if t["kind"] == "attachment"]
+        if attachments:
+            note = QLabel(
+                f"附件 {len(attachments)} 个（字体、封面等），"
+                + ("输出 MKV 时自动原样保留" if self.ext == ".mkv" else "当前容器不保留附件")
+            )
+            note.setStyleSheet("color: #888;")
+            self.tracks_layout.addWidget(note)
+
+        self.tracks_layout.addStretch()
+
+    @staticmethod
+    def _row_text(t, prefix):
+        parts = [f"{prefix}{t['ordinal']}", t["codec"]]
+        if t.get("lang"):
+            parts.append(t["lang"])
+        if t.get("title"):
+            parts.append(t["title"])
+        if t["kind"] == "video":
+            if t.get("width") and t.get("height"):
+                parts.append(f"{t['width']}×{t['height']}")
+            if t.get("fps"):
+                parts.append(t["fps"])
+        if t["kind"] == "audio":
+            if t.get("channels"):
+                parts.append(f"{t['channels']} 声道")
+        if t.get("bitrate"):
+            parts.append(t["bitrate"])
+        if t.get("default"):
+            parts.append("default")
+        if t.get("forced"):
+            parts.append("forced")
+        return "   ".join(parts)
+
+    def _set_all(self, checked):
+        for cb, _ in self.checks.values():
+            if cb.isEnabled():
+                cb.setChecked(checked)
+
+    def _on_ok(self):
+        keep = [t["index"] for t in self.info.get("tracks", []) if t["kind"] == "video"]
+        keep_audio, keep_sub = [], []
+        default_audio, default_sub = None, None
+
+        for idx, (cb, t) in self.checks.items():
+            if t["kind"] == "audio" and t.get("default"):
+                default_audio = idx
+            if t["kind"] == "subtitle" and t.get("default"):
+                default_sub = idx
+            if cb.isChecked():
+                keep.append(idx)
+                if t["kind"] == "audio":
+                    keep_audio.append(idx)
+                elif t["kind"] == "subtitle":
+                    keep_sub.append(idx)
+
+        if not keep_audio:
+            res = QMessageBox.question(
+                self, "确认删除音频",
+                "没有保留任何音频轨，输出的视频将没有声音。\n\n确定继续吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if res != QMessageBox.Yes:
+                return
+
+        try:
+            size = os.path.getsize(self.file_path)
+            mtime = os.path.getmtime(self.file_path)
+        except OSError as e:
+            QMessageBox.warning(self, "提示", f"无法读取源文件信息：{e}")
+            return
+
+        self.plan = {
+            "path": self.file_path,
+            "size": size,
+            "mtime": mtime,
+            "keep": sorted(keep),
+            "keep_audio": keep_audio,
+            "keep_sub": keep_sub,
+            # 原默认轨被删掉时，把剩下的第一条同类型轨设为默认
+            "fix_default_audio": bool(keep_audio) and default_audio is not None
+                                 and default_audio not in keep_audio,
+            "fix_default_sub": bool(keep_sub) and default_sub is not None
+                               and default_sub not in keep_sub,
+        }
+        self.accept()
+
+    def closeEvent(self, event):
+        # 探测线程未结束时等待，避免 QThread 被销毁导致崩溃
+        if self._worker and self._worker.isRunning():
+            self._worker.wait(3000)
+        super().closeEvent(event)
+
 # ==========================================
 # 主界面
 # ==========================================
@@ -594,9 +1036,12 @@ class MainWindow(QMainWindow):
         self.ffprobe_path = shutil.which("ffprobe")
         self.current_duration = None  # 当前选中文件的时长（秒）
         self._duration_token = 0
+        self._track_plan = None       # 轨道管理：当前文件的保留方案
 
         self.init_ui()
         self.check_env()
+        # 环境日志之后再检测硬件，保证启动日志顺序清晰
+        self.detect_hardware_accel()
 
     def init_ui(self):
         # 主部件和布局
@@ -667,12 +1112,20 @@ class MainWindow(QMainWindow):
                 "将字幕封装进视频 (无编码)",
                 "提取视频中的音频 (无编码)",
                 "修复视频索引 (无编码 Remux)",
+                "轨道管理 (删除音轨/字幕轨)",
                 "极简压缩 (H.265, CRF23)",
                 "视频转码为 MP4 (H.264)",
             ]
         )
         self.combo_mode.setFixedHeight(PARAM_H)
         param_layout.addWidget(self.combo_mode)
+
+        # 轨道管理按钮：仅在该模式下出现，且需要列表里只选中一个文件
+        self.btn_track = QPushButton("轨道管理…")
+        self.btn_track.setFixedHeight(PARAM_H)
+        self.btn_track.setVisible(False)
+        self.btn_track.setEnabled(False)
+        param_layout.addWidget(self.btn_track)
 
         # 截取参数
         self.check_start = QCheckBox("从")
@@ -835,24 +1288,28 @@ class MainWindow(QMainWindow):
         self.btn_scan_overhead.clicked.connect(self.scan_overhead)
         self.btn_pause.clicked.connect(self.toggle_pause)
         self.btn_stop.clicked.connect(self.stop_processing)
+        self.btn_track.clicked.connect(self.open_track_dialog)
         # 硬件加速互斥逻辑
         self.check_nvenc.stateChanged.connect(self.on_nvenc_toggled)
         self.check_qsv.stateChanged.connect(self.on_qsv_toggled)
 
         # 初始更新参数显示
         self.update_mode_params(0)
-        
-        # 程序启动时异步检测硬件
-        self.detect_hardware_accel()
 
     def check_env(self):
         """检查 FFmpeg 环境"""
         if not self.ffmpeg_path:
-            self.log_text.append(
-                "⚠️ 警告：在系统 PATH 中未找到 ffmpeg！请确保已加入环境变量，或修改代码中的路径。"
-            )
+            self.log_text.append("❌ 未检测到 ffmpeg：系统 PATH 中找不到 ffmpeg.exe")
+            self.log_text.append("   请安装 FFmpeg，并把 bin 目录加入系统环境变量 PATH，然后重启本程序。")
+            self.log_text.append("   验证方法：命令行执行 ffmpeg -version\n")
         else:
             self.log_text.append(f"✅ 已检测到 FFmpeg: {self.ffmpeg_path}")
+            if self.ffprobe_path:
+                self.log_text.append(f"✅ 已检测到 ffprobe: {self.ffprobe_path}")
+            else:
+                self.log_text.append(
+                    "⚠️ 未检测到 ffprobe：媒体信息、时长读取、冗余度扫描将不可用。"
+                )
             self.log_text.append(
                 "提示：无编码模式（截取、封装、提取）速度极快；转码模式较慢。\n"
             )
@@ -917,7 +1374,7 @@ class MainWindow(QMainWindow):
             self.check_start, self.edit_start, self.check_end, self.edit_end,
             self.lbl_sub, self.edit_sub, self.btn_select_sub, 
             self.check_smart_audio, self.lbl_crf, self.spin_crf,
-            self.check_nvenc, self.check_qsv
+            self.check_nvenc, self.check_qsv, self.btn_track
         ]:
             w.hide()
 
@@ -930,6 +1387,8 @@ class MainWindow(QMainWindow):
             self.lbl_sub.show()
             self.edit_sub.show()
             self.btn_select_sub.show()
+        elif "轨道" in mode:
+            self._update_track_button_state()
         elif "极简压缩" in mode:
             self.check_smart_audio.show()
             self.lbl_crf.show()
@@ -942,10 +1401,50 @@ class MainWindow(QMainWindow):
             self.check_nvenc.show()
             self.check_qsv.show()
 
+    def _update_track_button_state(self):
+        """轨道管理按钮：只在该模式下显示，且列表里只选中一个文件时才可点击"""
+        if "轨道" not in self.combo_mode.currentText():
+            self.btn_track.setVisible(False)
+            return
+
+        self.btn_track.setVisible(True)
+        selected = self.file_list.selectedItems()
+        has_one = len(selected) == 1
+        self.btn_track.setEnabled(has_one)
+
+        if not has_one:
+            self.btn_track.setText("轨道管理…")
+            self.btn_track.setToolTip("请先在列表里只选中一个文件")
+            return
+
+        plan = self._track_plan
+        if plan and os.path.normpath(plan["path"]) == os.path.normpath(selected[0].text()):
+            self.btn_track.setText("轨道管理…（已配置）")
+            self.btn_track.setToolTip("已配置保留方案，改完记得点「开始批量处理」")
+        else:
+            self.btn_track.setText("轨道管理…")
+            self.btn_track.setToolTip("选择要保留的音轨 / 字幕轨")
+
+    def open_track_dialog(self):
+        selected = self.file_list.selectedItems()
+        if len(selected) != 1:
+            QMessageBox.information(self, "提示", "请先在列表里只选中一个文件。")
+            return
+
+        file_path = selected[0].text()
+        dlg = TrackDialog(self, file_path, self.ffprobe_path)
+        if dlg.exec_() == QDialog.Accepted and dlg.plan:
+            self._track_plan = dlg.plan
+            self.log_text.append(
+                f"🎛 轨道管理：{os.path.basename(file_path)} 已配置保留 "
+                f"{len(dlg.plan['keep'])} 条轨道，点击「开始批量处理」执行无编码重封装。"
+            )
+            self._update_track_button_state()
+
     def add_files(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, "选择媒体文件", "",
-            "媒体文件 (*.mp4 *.mkv *.avi *.mov *.flv *.ts *.mp3 *.wav);;所有文件 (*)",
+            f"{build_ext_filter('媒体文件', MEDIA_EXTS)};;所有文件 (*)",
         )
         if files:
             self._add_files_to_list(files)
@@ -968,18 +1467,12 @@ class MainWindow(QMainWindow):
         if not folder:
             return
 
-        MEDIA_EXTS = {
-            ".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".webm",
-            ".m4v", ".wmv", ".mpg", ".mpeg", ".rmvb",
-            ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma",
-            ".srt", ".ass", ".vtt",
-        }
-
+        # 直接复用模块级 MEDIA_EXTS：字幕文件不属于媒体，不进列表
         found = []
-        for root, _, names in os.walk(folder):
-            for name in names:
-                ext = os.path.splitext(name)[1].lower()
-                if ext in MEDIA_EXTS:
+        for root, dirs, names in os.walk(folder):
+            dirs.sort()
+            for name in sorted(names):
+                if os.path.splitext(name)[1].lower() in MEDIA_EXTS:
                     found.append(os.path.join(root, name))
 
         if not found:
@@ -1072,6 +1565,8 @@ class MainWindow(QMainWindow):
         return f"{h:02d}:{m:02d}:{s:02d}"
 
     def on_file_selection_changed(self):
+        self._update_track_button_state()
+
         selected = self.file_list.selectedItems()
         if len(selected) != 1:
             return
@@ -1102,9 +1597,11 @@ class MainWindow(QMainWindow):
     def remove_selected(self):
         for item in self.file_list.selectedItems():
             self.file_list.takeItem(self.file_list.row(item))
+        self._update_track_button_state()
 
     def clear_files(self):
         self.file_list.clear()
+        self._update_track_button_state()
 
     def select_subtitle(self):
         file, _ = QFileDialog.getOpenFileName(
@@ -1124,6 +1621,66 @@ class MainWindow(QMainWindow):
         if dir_path:
             self.edit_out_dir.setText(dir_path)
 
+    def _build_track_tasks(self, suffix):
+        """轨道管理：只为当前选中的单个文件生成一条无编码重封装命令"""
+        selected = self.file_list.selectedItems()
+        if len(selected) != 1:
+            QMessageBox.warning(self, "提示", "轨道管理只处理单个文件，请先在列表里只选中一个文件。")
+            return []
+
+        input_file = selected[0].text()
+        plan = self._track_plan
+        if not plan:
+            QMessageBox.warning(self, "提示", "请先点击「轨道管理…」选择要保留的轨道。")
+            return []
+
+        if os.path.normpath(plan["path"]) != os.path.normpath(input_file):
+            QMessageBox.warning(
+                self, "提示", "轨道配置与当前选中的文件不一致，请重新点击「轨道管理…」。"
+            )
+            return []
+
+        # 配置后源文件被替换/改动时，流索引可能已经变了，必须重新配置
+        try:
+            if (os.path.getsize(input_file) != plan["size"]
+                    or os.path.getmtime(input_file) != plan["mtime"]):
+                QMessageBox.warning(
+                    self, "文件已变化", "源文件在配置轨道后被修改，请重新点击「轨道管理…」。"
+                )
+                return []
+        except OSError:
+            QMessageBox.warning(self, "提示", "源文件无法访问，请检查文件是否还在。")
+            return []
+
+        base_name, ext = os.path.splitext(os.path.basename(input_file))
+
+        if self.check_same_dir.isChecked():
+            out_dir = os.path.dirname(input_file)
+        else:
+            out_dir = self.edit_out_dir.text().strip()
+            if not out_dir:
+                QMessageBox.warning(self, "错误", "请选择输出目录！")
+                return []
+
+        output_file = os.path.normpath(os.path.join(out_dir, f"{base_name}{suffix}{ext}"))
+
+        cmd = [self.ffmpeg_path, "-y", "-i", input_file]
+        for idx in plan["keep"]:
+            cmd.extend(["-map", f"0:{idx}"])
+        # MKV 的字体等附件（ASS 字幕依赖）跟着一起保留
+        if ext.lower() == ".mkv":
+            cmd.extend(["-map", "0:t?"])
+        cmd.extend(["-c", "copy", "-map_chapters", "0", "-map_metadata", "0"])
+        if plan.get("fix_default_audio"):
+            cmd.extend(["-disposition:a:0", "default"])
+        if plan.get("fix_default_sub"):
+            cmd.extend(["-disposition:s:0", "default"])
+        if ext.lower() in (".mp4", ".m4v", ".mov"):
+            cmd.extend(["-movflags", "+faststart"])
+        cmd.append(output_file)
+
+        return [(cmd, output_file)]
+
     def generate_tasks(self):
         """生成所有执行任务"""
         tasks = []
@@ -1132,6 +1689,10 @@ class MainWindow(QMainWindow):
 
         # 提前获取用户设置的 CRF 值
         crf_val = str(self.spin_crf.value())
+
+        # ============ 特例：轨道管理（单文件，删除指定音轨/字幕轨） ============
+        if "轨道" in mode:
+            return self._build_track_tasks(suffix)
 
         # ============ 特例：无编码合并视频 ============
         if "无编码合并" in mode:
@@ -1219,7 +1780,46 @@ class MainWindow(QMainWindow):
                 if not sub_file:
                     QMessageBox.warning(self, "错误", "请选择字幕文件！")
                     return []
-                cmd.extend(["-i", input_file, "-i", sub_file, "-c", "copy", "-c:s", "mov_text", output_file])
+
+                ext_lower = ext.lower()
+                sub_codec = SUB_CODEC_BY_EXT.get(ext_lower)
+
+                # 容器不支持字幕：直接拦下，避免 ffmpeg 报难懂的错误
+                if not sub_codec:
+                    QMessageBox.warning(
+                        self, "容器不支持字幕封装",
+                        f"「{ext_lower}」容器无法封装文字字幕。\n\n"
+                        f"文件：{os.path.basename(input_file)}\n\n"
+                        "请使用 MP4 / MKV 格式的源文件；"
+                        "可先用「视频转码为 MP4」统一格式后再处理。",
+                    )
+                    return []
+
+                # 位图字幕只能原样复制进 MKV，转不成 MP4 的文字字幕
+                sub_ext = os.path.splitext(sub_file)[1].lower()
+                if sub_ext in BITMAP_SUB_EXTS and sub_codec != "copy":
+                    QMessageBox.warning(
+                        self, "位图字幕不支持",
+                        "位图字幕（.sub / .sup / .idx）只能原样封装进 MKV，"
+                        "无法转换为 MP4 的文字字幕。\n\n"
+                        "请改用 MKV 源文件，或换一份文字字幕（.srt / .ass / .vtt）。",
+                    )
+                    return []
+
+                # 保留源文件原有字幕轨；新字幕作为第一条字幕轨插入并设为默认
+                cmd.extend([
+                    "-i", input_file, "-i", sub_file,
+                    "-map", "0:v:0", "-map", "0:a?",
+                    "-map", "1:s:0", "-map", "0:s?",
+                    "-c:v", "copy", "-c:a", "copy", "-c:s", "copy",
+                ])
+                if sub_codec != "copy":
+                    cmd.extend(["-c:s:0", sub_codec])
+                cmd.extend(["-disposition:s:0", "default"])
+
+                if ext_lower in (".mp4", ".m4v", ".mov"):
+                    cmd.extend(["-movflags", "+faststart"])
+                cmd.append(output_file)
 
             elif "提取" in mode:
                 cmd.extend(["-i", input_file, "-vn", "-c:a", "copy", output_file])
@@ -1296,8 +1896,33 @@ class MainWindow(QMainWindow):
         return tasks
 
     def start_processing(self):
+        # 环境检查：没有 ffmpeg 直接拦住，不进入任务生成
+        if not self.ffmpeg_path:
+            self.log_text.append("❌ 未检测到 ffmpeg，任务已取消。")
+            QMessageBox.critical(
+                self, "找不到 FFmpeg",
+                "未在系统 PATH 中检测到 ffmpeg.exe，无法执行任务。\n\n"
+                "请先安装 FFmpeg，并把 bin 目录加入系统环境变量 PATH，"
+                "然后重新启动本程序。\n\n"
+                "验证方法：在命令行执行 ffmpeg -version",
+            )
+            return
+
         if self.file_list.count() == 0:
             QMessageBox.warning(self, "提示", "请先添加需要处理的文件！")
+            return
+
+        # 后缀检查：后缀留空会导致输出文件与源文件同名，-y 会直接覆盖源文件
+        if not self.edit_suffix.text().strip():
+            QMessageBox.warning(
+                self, "后缀不能为空",
+                "输出文件名后缀不能为空！\n\n"
+                "后缀用于区分输出文件和源文件，留空时输出文件会与源文件同名，"
+                "处理过程将直接覆盖源文件（且不可恢复）。\n\n"
+                "请填写后缀后再开始处理，例如：_processed",
+            )
+            self.edit_suffix.setFocus()
+            self.edit_suffix.selectAll()
             return
 
         tasks = self.generate_tasks()
@@ -1312,12 +1937,32 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.log_text.clear()
         self.log_text.append(f"准备处理 {len(tasks)} 个文件...\n")
+        self.log_subtitle_hint()
 
         self.worker = FFmpegWorker(tasks)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.log_signal.connect(self.append_log)
         self.worker.finished_signal.connect(self.processing_finished)
         self.worker.start()
+
+    def log_subtitle_hint(self):
+        """字幕封装到 MP4 时提示样式丢失（只写日志，不打断批量任务）"""
+        if "字幕封装" not in self.combo_mode.currentText():
+            return
+
+        sub_ext = os.path.splitext(self.edit_sub.text().strip())[1].lower()
+        if sub_ext not in (".ass", ".ssa"):
+            return
+
+        exts = set()
+        for i in range(self.file_list.count()):
+            exts.add(os.path.splitext(self.file_list.item(i).text())[1].lower())
+
+        if exts & {".mp4", ".m4v", ".mov"}:
+            self.log_text.append(
+                "⚠️ 提示：MP4 容器使用 mov_text 封装字幕，ASS/SSA 的字体、位置、颜色等"
+                "特效样式会丢失；如需保留特效，请将源文件转为 MKV 后再封装。\n"
+            )
 
     def update_progress(self, current, total):
         percentage = int((current / total) * 100)
@@ -1338,19 +1983,77 @@ class MainWindow(QMainWindow):
             self.log_text.verticalScrollBar().maximum()
         )
 
-    def processing_finished(self):
-        self.log_text.append("\n🎉 所有任务处理完成！")
+    def processing_finished(self, results=None):
+        results = results or []
+        ok_items = [r for r in results if r.get("ok")]
+        stopped_items = [r for r in results if r.get("stopped")]
+        failed = [r for r in results if not r.get("ok") and not r.get("stopped")]
+        planned = len(getattr(self.worker, "tasks", []) or [])
+        not_run = max(planned - len(results), 0)
+
         self.btn_run.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("⏸ 暂停")
         self.btn_stop.setEnabled(False)
-        
-        # 弹窗逻辑保持你原来的
+
+        # ---- 处理汇总 ----
+        self.log_text.append("\n" + "=" * 52)
+        self.log_text.append("📊 处理汇总")
+        self.log_text.append("=" * 52)
+        summary = (
+            f"计划 {planned} 个 ｜ ✅ 成功 {len(ok_items)} 个 ｜ ❌ 失败 {len(failed)} 个"
+        )
+        if stopped_items:
+            summary += f" ｜ ⏹ 中止 {len(stopped_items)} 个"
+        if not_run:
+            summary += f" ｜ 未执行 {not_run} 个"
+        self.log_text.append(summary)
+
+        if failed:
+            self.log_text.append("\n失败清单：")
+            for r in failed:
+                name = os.path.basename(r["output"])
+                if r.get("error"):
+                    self.log_text.append(f"  • {name}：{r['error']}")
+                else:
+                    self.log_text.append(
+                        f"  • {name}：返回码 {describe_return_code(r.get('code'))}"
+                    )
+                if r.get("partial"):
+                    self.log_text.append(f"    半成品已保留（不能当成品使用）：{r['output']}")
+
+        if stopped_items:
+            self.log_text.append("\n已中止：")
+            for r in stopped_items:
+                self.log_text.append(f"  • {os.path.basename(r['output'])}")
+
+        if failed:
+            self.log_text.append("\n⚠️ 批量处理结束（存在失败的任务，详见上方清单）。")
+        elif stopped_items or not_run:
+            self.log_text.append("\n⏹ 批量处理已中止，剩余任务未执行。")
+        else:
+            self.log_text.append("\n🎉 全部任务处理完成！")
+
+        # ---- 弹窗：成功、失败、中止用不同图标与标题 ----
         msg = QMessageBox(self)
-        msg.setWindowTitle("完成")
-        msg.setIcon(QMessageBox.Information)
-        msg.setText("批量处理已结束！")
-        msg.setInformativeText("是否需要打开输出文件夹？")
+        if failed:
+            msg.setWindowTitle("处理结束（有失败）")
+            msg.setIcon(QMessageBox.Warning)
+            msg.setText(f"批量处理结束：成功 {len(ok_items)} 个，失败 {len(failed)} 个。")
+            msg.setInformativeText("失败原因与半成品路径见日志。是否打开输出文件夹？")
+        elif stopped_items or not_run:
+            msg.setWindowTitle("已中止")
+            msg.setIcon(QMessageBox.Information)
+            msg.setText(
+                f"批量处理已中止：完成 {len(ok_items)} 个，"
+                f"中止 {len(stopped_items)} 个，未执行 {not_run} 个。"
+            )
+            msg.setInformativeText("是否打开输出文件夹？")
+        else:
+            msg.setWindowTitle("完成")
+            msg.setIcon(QMessageBox.Information)
+            msg.setText("批量处理已结束！")
+            msg.setInformativeText(f"共完成 {len(ok_items)} 个任务。是否打开输出文件夹？")
         btn_open = msg.addButton("📂 打开输出文件夹", QMessageBox.AcceptRole)
         msg.addButton("关闭", QMessageBox.RejectRole)
         msg.exec_()
