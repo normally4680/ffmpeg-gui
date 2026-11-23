@@ -176,6 +176,33 @@ def describe_return_code(code):
     return "{}（0x{:08X}）".format(code, code)
 
 
+# 崩溃自动重试：仅针对进程级崩溃，普通报错重试也没有意义
+CRASH_RETRY_TIMES = 1
+CRASH_RETRY_DELAY = 3.0
+
+
+def is_crash_code(code):
+    """返回码是否属于进程级崩溃（0xC0000000 ~ 0xC0000FFF）"""
+    return isinstance(code, int) and 0xC0000000 <= code <= 0xC0000FFF
+
+
+def suppress_windows_error_dialogs():
+    """关闭 WER 崩溃弹窗。否则 ffmpeg 崩溃时进程会被对话框挂住，重试无从触发。"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        SEM_FAILCRITICALERRORS = 0x0001
+        SEM_NOGPFAULTERRORBOX = 0x0002
+        SEM_NOOPENFILEERRORBOX = 0x8000
+        ctypes.windll.kernel32.SetErrorMode(
+            SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+        )
+    except Exception:
+        pass
+
+
+
 
 
 
@@ -300,125 +327,217 @@ class FFmpegWorker(QThread):
             except Exception:
                 pass
 
+    @staticmethod
+    def _input_from_cmd(cmd):
+        """从命令里取出第一个 -i 的输入路径（合并模式拿到的是临时列表文件）"""
+        try:
+            return cmd[cmd.index("-i") + 1]
+        except (ValueError, IndexError):
+            return ""
+
+    @staticmethod
+    def _file_meta(path):
+        try:
+            st = os.stat(path)
+            return (st.st_size, st.st_mtime)
+        except OSError:
+            return None
+
+    @classmethod
+    def _cleanup_partial(cls, output_file, source_file, before_meta):
+        """删除失败/中止产生的半成品。
+
+        两条保护：不删源文件；执行前就存在且本次未被改动的文件（可能是上一次的成品）也不删。
+        """
+        try:
+            if not output_file or not os.path.exists(output_file):
+                return False
+            if source_file and os.path.normpath(output_file) == os.path.normpath(source_file):
+                return False
+            after_meta = cls._file_meta(output_file)
+            if after_meta is None:
+                return False
+            if before_meta is not None and after_meta == before_meta:
+                return False
+            os.remove(output_file)
+            return True
+        except OSError:
+            return False
+
+    def _wait_interruptible(self, seconds):
+        """重试前的等待，期间可被停止操作打断"""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self.is_stopped:
+                return False
+            time.sleep(0.2)
+        return True
+
+    def _run_attempt(self, cmd, output_file):
+        """执行一次 ffmpeg，返回 (返回码, 是否被用户停止)"""
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+
+        # 智能音频占位符处理（用副本，避免重试时占位符已被清掉）
+        if "__SMART_AUDIO__" in cmd:
+            cmd = list(cmd)
+            cmd.remove("__SMART_AUDIO__")
+            input_file = self._input_from_cmd(cmd)
+            audio_params = []
+            if input_file:
+                audio_bitrate = self.get_audio_bitrate(input_file)
+                if audio_bitrate > 192000:
+                    self.log_signal.emit(f"   🔊 音频智能转码 (源码率 {audio_bitrate/1000:.0f}k > 192k)")
+                    audio_params = ["-c:a", "aac", "-b:a", "192k"]
+                else:
+                    self.log_signal.emit(f"   🔊 音频智能复制 (源码率 {audio_bitrate/1000:.0f}k <= 192k)")
+                    audio_params = ["-c:a", "copy"]
+            else:
+                audio_params = ["-c:a", "copy"]
+            out_file = cmd[-1]
+            cmd = cmd[:-1] + audio_params + [out_file]
+
+        self.log_signal.emit(f"💻 执行命令: {subprocess.list2cmdline(cmd)}")
+
+        self.process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            encoding="utf-8", errors="ignore", startupinfo=startupinfo,
+        )
+        self.is_paused = False
+
+        last_emit = 0
+        last_line = ""
+        try:
+            for line in self.process.stdout:
+                # 如果中途被强制停止，直接跳出读取循环
+                if self.is_stopped:
+                    break
+
+                line = line.strip()
+                if not line:
+                    continue
+
+                if "error" in line.lower() or "warning" in line.lower():
+                    self.log_signal.emit(line)
+                    continue
+
+                now = time.time()
+                if ("frame=" in line or "size=" in line or "speed=" in line):
+                    if now - last_emit >= 2.0:
+                        self.log_signal.emit(line)
+                        last_emit = now
+                        last_line = line
+                else:
+                    self.log_signal.emit(line)
+        except Exception as read_err:
+            self.log_signal.emit(f"⚠️ 读取日志时发生中断: {read_err}")
+        finally:
+            # 安全地等待并关闭
+            if self.process:
+                self.process.wait()
+                if self.process.stdout:
+                    self.process.stdout.close()
+
+        if last_line:
+            self.log_signal.emit(last_line)
+
+        # 在置空 self.process 之前，先获取 returncode
+        return_code = None
+        if self.process:
+            return_code = self.process.returncode
+        self.process = None
+        return return_code, self.is_stopped
+
     def run(self):
         total = len(self.tasks)
         self.results = []
+        max_attempts = 1 + CRASH_RETRY_TIMES
+
         for idx, (cmd, output_file) in enumerate(self.tasks):
             if self.is_stopped:
                 break
 
             self.log_signal.emit(f"\n[{idx+1}/{total}] 开始处理: {os.path.basename(output_file)}")
 
-            # 本任务执行台账：成功/失败、返回码、是否留下半成品
+            # 本任务执行台账：成功/失败、返回码、尝试次数
             record = {
                 "output": output_file,
                 "code": None,
                 "ok": False,
                 "stopped": False,
                 "error": "",
-                "partial": False,
+                "attempts": 0,
+                "retried": False,
             }
+            source_file = self._input_from_cmd(cmd)
+            attempt = 0
 
-            try:
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = subprocess.SW_HIDE
+            while attempt < max_attempts:
+                attempt += 1
+                record["attempts"] = attempt
+                if attempt > 1:
+                    self.log_signal.emit(
+                        f"🔄 第 {attempt}/{max_attempts} 次尝试: {os.path.basename(output_file)}"
+                    )
 
-                # 智能音频占位符处理 (原有逻辑)
-                if "__SMART_AUDIO__" in cmd:
-                    cmd.remove("__SMART_AUDIO__")
-                    input_file = cmd[cmd.index("-i") + 1] if "-i" in cmd else ""
-                    audio_params = []
-                    if input_file:
-                        audio_bitrate = self.get_audio_bitrate(input_file)
-                        if audio_bitrate > 192000:
-                            self.log_signal.emit(f"   🔊 音频智能转码 (源码率 {audio_bitrate/1000:.0f}k > 192k)")
-                            audio_params = ["-c:a", "aac", "-b:a", "192k"]
-                        else:
-                            self.log_signal.emit(f"   🔊 音频智能复制 (源码率 {audio_bitrate/1000:.0f}k <= 192k)")
-                            audio_params = ["-c:a", "copy"]
-                    else:
-                        audio_params = ["-c:a", "copy"]
-                    out_file = cmd[-1]
-                    cmd = cmd[:-1] + audio_params + [out_file]
-
-                self.log_signal.emit(f"💻 执行命令: {subprocess.list2cmdline(cmd)}")
-
-                self.process = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    encoding="utf-8", errors="ignore", startupinfo=startupinfo,
-                )
-                self.is_paused = False
-
-                last_emit = 0
-                last_line = ""
+                before_meta = self._file_meta(output_file)
                 try:
-                    for line in self.process.stdout:
-                        # 如果中途被强制停止，直接跳出读取循环
-                        if self.is_stopped:
-                            break
-                        
-                        line = line.strip()
-                        if not line:
-                            continue
-
-                        if "error" in line.lower() or "warning" in line.lower():
-                            self.log_signal.emit(line)
-                            continue
-
-                        now = time.time()
-                        if ("frame=" in line or "size=" in line or "speed=" in line):
-                            if now - last_emit >= 2.0:
-                                self.log_signal.emit(line)
-                                last_emit = now
-                                last_line = line
-                        else:
-                            self.log_signal.emit(line)
-                except Exception as read_err:
-                    self.log_signal.emit(f"⚠️ 读取日志时发生中断: {read_err}")
-                finally:
-                    # 安全地等待并关闭
-                    if self.process:
-                        self.process.wait()
-                        if self.process.stdout:
-                            self.process.stdout.close()
-
-                # 如果用户点击了停止，处理半成品文件
-                if self.is_stopped:
-                    if os.path.exists(output_file):
-                        try: os.remove(output_file)
-                        except: pass
-                    self.log_signal.emit(f"⏹ 任务被终止，已清理半成品: {os.path.basename(output_file)}")
-                    record["stopped"] = True
-                    record["error"] = "任务被手动停止"
-                    self.results.append(record)
+                    return_code, aborted = self._run_attempt(cmd, output_file)
+                except Exception as e:
+                    record["error"] = str(e)
+                    self.log_signal.emit(f"❌ 发生严重异常: {str(e)}")
                     self.process = None
+                    if self._cleanup_partial(output_file, source_file, before_meta):
+                        self.log_signal.emit(f"🧹 已清理半成品: {os.path.basename(output_file)}")
                     break
 
-                if last_line:
-                    self.log_signal.emit(last_line)
+                # 用户中途点了停止
+                if aborted:
+                    cleaned = self._cleanup_partial(output_file, source_file, before_meta)
+                    self.log_signal.emit(
+                        "⏹ 任务被终止"
+                        + (f"，已清理半成品: {os.path.basename(output_file)}" if cleaned else "")
+                    )
+                    record["stopped"] = True
+                    record["error"] = "任务被手动停止"
+                    break
 
-                # 核心修复：在置空 self.process 之前，先获取 returncode
-                if self.process:
-                    return_code = self.process.returncode
-                    record["code"] = return_code
-                    record["ok"] = (return_code == 0)
-                    if return_code == 0:
-                        self.log_signal.emit(f"✅ 成功: {os.path.basename(output_file)}")
-                    else:
-                        record["partial"] = os.path.exists(output_file)
-                        self.log_signal.emit(
-                            f"❌ 失败: {os.path.basename(output_file)} "
-                            f"返回码 {describe_return_code(return_code)}"
-                        )
-                    # 到这里当前任务处理完毕，再安全置空
-                    self.process = None
+                record["code"] = return_code
 
-            except Exception as e:
-                record["error"] = str(e)
-                self.log_signal.emit(f"❌ 发生严重异常: {str(e)}")
-                # 防止异常导致 self.process 没被释放
-                self.process = None
+                if return_code == 0:
+                    record["ok"] = True
+                    record["retried"] = attempt > 1
+                    prefix = "✅ 重试后成功" if attempt > 1 else "✅ 成功"
+                    self.log_signal.emit(f"{prefix}: {os.path.basename(output_file)}")
+                    break
+
+                # 失败：一律清理半成品
+                cleaned = self._cleanup_partial(output_file, source_file, before_meta)
+
+                # 仅进程级崩溃才自动重试，普通报错直接失败
+                if is_crash_code(return_code) and attempt < max_attempts:
+                    self.log_signal.emit(
+                        f"⚠️ 异常退出: {os.path.basename(output_file)} "
+                        f"返回码 {describe_return_code(return_code)}"
+                        + ("，已清理半成品" if cleaned else "")
+                    )
+                    self.log_signal.emit(
+                        f"⏳ {int(CRASH_RETRY_DELAY)} 秒后自动重试"
+                        f"（第 {attempt + 1}/{max_attempts} 次）"
+                    )
+                    if not self._wait_interruptible(CRASH_RETRY_DELAY):
+                        record["stopped"] = True
+                        record["error"] = "重试等待期间被停止"
+                        break
+                    continue
+
+                self.log_signal.emit(
+                    f"❌ 失败: {os.path.basename(output_file)} "
+                    f"返回码 {describe_return_code(return_code)}"
+                    + ("，已清理半成品" if cleaned else "")
+                )
+                break
 
             self.results.append(record)
             self.progress_signal.emit(idx + 1, total)
@@ -1986,6 +2105,7 @@ class MainWindow(QMainWindow):
     def processing_finished(self, results=None):
         results = results or []
         ok_items = [r for r in results if r.get("ok")]
+        retried_items = [r for r in ok_items if r.get("retried")]
         stopped_items = [r for r in results if r.get("stopped")]
         failed = [r for r in results if not r.get("ok") and not r.get("stopped")]
         planned = len(getattr(self.worker, "tasks", []) or [])
@@ -2003,6 +2123,8 @@ class MainWindow(QMainWindow):
         summary = (
             f"计划 {planned} 个 ｜ ✅ 成功 {len(ok_items)} 个 ｜ ❌ 失败 {len(failed)} 个"
         )
+        if retried_items:
+            summary += f" ｜ 🔁 重试成功 {len(retried_items)} 个"
         if stopped_items:
             summary += f" ｜ ⏹ 中止 {len(stopped_items)} 个"
         if not_run:
@@ -2013,14 +2135,14 @@ class MainWindow(QMainWindow):
             self.log_text.append("\n失败清单：")
             for r in failed:
                 name = os.path.basename(r["output"])
+                attempts = r.get("attempts") or 1
                 if r.get("error"):
-                    self.log_text.append(f"  • {name}：{r['error']}")
+                    detail = r["error"]
                 else:
-                    self.log_text.append(
-                        f"  • {name}：返回码 {describe_return_code(r.get('code'))}"
-                    )
-                if r.get("partial"):
-                    self.log_text.append(f"    半成品已保留（不能当成品使用）：{r['output']}")
+                    detail = f"返回码 {describe_return_code(r.get('code'))}"
+                if attempts > 1:
+                    detail += f"，已自动重试 {attempts - 1} 次"
+                self.log_text.append(f"  • {name}：{detail}")
 
         if stopped_items:
             self.log_text.append("\n已中止：")
@@ -2036,11 +2158,16 @@ class MainWindow(QMainWindow):
 
         # ---- 弹窗：成功、失败、中止用不同图标与标题 ----
         msg = QMessageBox(self)
+        retry_note = (
+            f"其中 {len(retried_items)} 个文件经自动重试后成功。" if retried_items else ""
+        )
         if failed:
             msg.setWindowTitle("处理结束（有失败）")
             msg.setIcon(QMessageBox.Warning)
             msg.setText(f"批量处理结束：成功 {len(ok_items)} 个，失败 {len(failed)} 个。")
-            msg.setInformativeText("失败原因与半成品路径见日志。是否打开输出文件夹？")
+            msg.setInformativeText(
+                retry_note + "失败原因见日志，失败产生的半成品已自动清理。是否打开输出文件夹？"
+            )
         elif stopped_items or not_run:
             msg.setWindowTitle("已中止")
             msg.setIcon(QMessageBox.Information)
@@ -2048,12 +2175,14 @@ class MainWindow(QMainWindow):
                 f"批量处理已中止：完成 {len(ok_items)} 个，"
                 f"中止 {len(stopped_items)} 个，未执行 {not_run} 个。"
             )
-            msg.setInformativeText("是否打开输出文件夹？")
+            msg.setInformativeText(retry_note + "是否打开输出文件夹？")
         else:
             msg.setWindowTitle("完成")
             msg.setIcon(QMessageBox.Information)
             msg.setText("批量处理已结束！")
-            msg.setInformativeText(f"共完成 {len(ok_items)} 个任务。是否打开输出文件夹？")
+            msg.setInformativeText(
+                retry_note + f"共完成 {len(ok_items)} 个任务。是否打开输出文件夹？"
+            )
         btn_open = msg.addButton("📂 打开输出文件夹", QMessageBox.AcceptRole)
         msg.addButton("关闭", QMessageBox.RejectRole)
         msg.exec_()
@@ -2129,6 +2258,9 @@ class MainWindow(QMainWindow):
         self.btn_scan_overhead.setEnabled(True)
 
 if __name__ == "__main__":
+    # 先关掉 WER 崩溃弹窗，再启动界面：否则 ffmpeg 崩溃会弹框并卡住整个队列
+    suppress_windows_error_dialogs()
+
     app = QApplication(sys.argv)
     
     # 使用 resource_path 获取正确路径，并且给主窗口也设置一次图标
