@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import json
 import time
+import threading
 import psutil
 from PyQt5.QtWidgets import (
     QApplication,
@@ -39,6 +40,109 @@ def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
+
+
+# ==========================================
+# 日志落盘（ffmpeg-gui.log，单文件 10MB 上限）
+# ==========================================
+MAX_LOG_BYTES = 10 * 1024 * 1024
+KEEP_LOG_BYTES = 5 * 1024 * 1024
+
+
+def app_dir():
+    """程序所在目录：打包后为 exe 目录，源码运行时为 main.py 所在目录"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+class LogFileWriter:
+    """把界面日志同步写入 ffmpeg-gui.log，超出 10MB 时丢弃最早内容"""
+
+    def __init__(self):
+        self.enabled = True
+        self.path = os.path.join(app_dir(), "ffmpeg-gui.log")
+        self._lock = threading.Lock()
+        if not self._probe(self.path):
+            # 程序目录不可写时（比如装在 Program Files）退到用户目录
+            fallback_dir = os.path.join(
+                os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ffmpeg-gui"
+            )
+            try:
+                os.makedirs(fallback_dir, exist_ok=True)
+            except OSError:
+                pass
+            self.path = os.path.join(fallback_dir, "ffmpeg-gui.log")
+            self.enabled = self._probe(self.path)
+
+    @staticmethod
+    def _probe(path):
+        try:
+            with open(path, "a", encoding="utf-8"):
+                pass
+            return True
+        except OSError:
+            return False
+
+    def write(self, text):
+        if not self.enabled:
+            return
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with self._lock:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    for line in str(text).split("\n"):
+                        if line.strip():
+                            f.write("[{}] {}\n".format(stamp, line))
+                        else:
+                            f.write("\n")
+        except OSError:
+            self.enabled = False
+            return
+
+        self._rotate_if_needed()
+
+    def _rotate_if_needed(self):
+        """超过 10MB 时只保留最后 5MB，避免日志无限增长"""
+        try:
+            if os.path.getsize(self.path) <= MAX_LOG_BYTES:
+                return
+        except OSError:
+            return
+
+        with self._lock:
+            try:
+                if os.path.getsize(self.path) <= MAX_LOG_BYTES:
+                    return
+                with open(self.path, "rb") as f:
+                    f.seek(-KEEP_LOG_BYTES, os.SEEK_END)
+                    data = f.read()
+                # 丢掉被截断的第一行
+                cut = data.find(b"\n")
+                if cut != -1:
+                    data = data[cut + 1:]
+                marker = "[{}] ===== 日志超过 10MB，已丢弃最早的内容 =====\n".format(
+                    time.strftime("%Y-%m-%d %H:%M:%S")
+                ).encode("utf-8")
+                with open(self.path, "wb") as f:
+                    f.write(marker)
+                    f.write(data)
+            except OSError:
+                pass
+
+
+class LogView(QTextEdit):
+    """日志框：append 到界面的同时写入日志文件"""
+
+    def __init__(self, writer=None, parent=None):
+        super().__init__(parent)
+        self._writer = writer
+
+    def append(self, text):
+        super().append(text)
+        if self._writer:
+            self._writer.write(text)
+
 
 # ==========================================
 # 全局样式表
@@ -300,6 +404,7 @@ class FFmpegWorker(QThread):
         self.is_paused = False
         self.is_stopped = False
         self.results = []   # 每个任务的执行台账
+        self.current_output = ""   # 正在处理的任务输出路径
 
     def pause_process(self):
         if self.process and not self.is_stopped:
@@ -472,6 +577,7 @@ class FFmpegWorker(QThread):
             }
             source_file = self._input_from_cmd(cmd)
             attempt = 0
+            self.current_output = output_file
 
             while attempt < max_attempts:
                 attempt += 1
@@ -540,6 +646,7 @@ class FFmpegWorker(QThread):
                 break
 
             self.results.append(record)
+            self.current_output = ""
             self.progress_signal.emit(idx + 1, total)
 
         self.finished_signal.emit(self.results)
@@ -1156,8 +1263,11 @@ class MainWindow(QMainWindow):
         self.current_duration = None  # 当前选中文件的时长（秒）
         self._duration_token = 0
         self._track_plan = None       # 轨道管理：当前文件的保留方案
+        self._closing = False         # 关闭流程中，避免收尾弹窗打断退出
+        self.log_writer = LogFileWriter()
 
         self.init_ui()
+        self.log_text.append("=" * 28 + " 启动 FFmpeg GUI " + "=" * 28)
         self.check_env()
         # 环境日志之后再检测硬件，保证启动日志顺序清晰
         self.detect_hardware_accel()
@@ -1373,7 +1483,7 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_stop, stretch=1)
         btn_row.addWidget(self.btn_open_out, stretch=2)
 
-        self.log_text = QTextEdit()
+        self.log_text = LogView(self.log_writer)
         self.log_text.setReadOnly(True)
         self.log_text.setPlaceholderText("执行日志将显示在这里...")
         self.log_text.setMinimumHeight(250)
@@ -2103,6 +2213,9 @@ class MainWindow(QMainWindow):
         )
 
     def processing_finished(self, results=None):
+        if self._closing:
+            # 关闭流程中不再弹收尾对话框
+            return
         results = results or []
         ok_items = [r for r in results if r.get("ok")]
         retried_items = [r for r in ok_items if r.get("retried")]
@@ -2207,26 +2320,126 @@ class MainWindow(QMainWindow):
             self.btn_stop.setEnabled(False)
             self.log_text.append("⏹ 正在停止当前任务并清理半成品...")
 
-    def open_output_folder(self):
-        """打开输出文件夹"""
-        # 优先使用显式指定的输出目录
-        if not self.check_same_dir.isChecked():
-            out_dir = self.edit_out_dir.text().strip()
-            if out_dir and os.path.isdir(out_dir):
-                os.startfile(out_dir)
+    def closeEvent(self, event):
+        """关闭程序：有任务在跑时二次确认"""
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.isRunning():
+            box = QMessageBox(self)
+            box.setWindowTitle("正在处理")
+            box.setIcon(QMessageBox.Warning)
+            box.setText("当前还有任务正在处理。")
+            box.setInformativeText(
+                "退出会立即终止 ffmpeg 进程，并清理未完成的半成品文件。\n\n确定要退出吗？"
+            )
+            btn_quit = box.addButton("确认退出", QMessageBox.DestructiveRole)
+            box.addButton("取消", QMessageBox.RejectRole)
+            box.exec_()
+            if box.clickedButton() is not btn_quit:
+                event.ignore()
                 return
-            QMessageBox.warning(self, "提示", "输出目录未设置或不存在")
+
+            self._closing = True
+            self.log_text.append("⏹ 用户关闭程序，正在终止当前任务…")
+            worker.stop_process()
+            if not worker.wait(5000):
+                self.log_text.append("⚠️ 等待 ffmpeg 退出超时，界面将直接关闭。")
+
+        self.log_text.append("=" * 28 + " 退出 FFmpeg GUI " + "=" * 28)
+        event.accept()
+
+    def _output_dir_for(self, input_file):
+        """按当前输出设置，返回该文件应该输出到哪个目录"""
+        if self.check_same_dir.isChecked():
+            return os.path.dirname(input_file)
+        return self.edit_out_dir.text().strip()
+
+    def _expected_output_path(self, input_file):
+        """按当前模式推算该文件处理后应生成的文件路径（仅用于判断是否已处理）"""
+        mode = self.combo_mode.currentText()
+        suffix = self.edit_suffix.text().strip()
+
+        if "无编码合并" in mode:
+            if self.file_list.count() == 0:
+                return ""
+            first_file = self.file_list.item(0).text()
+            base_name, ext = os.path.splitext(os.path.basename(first_file))
+            out_dir = self._output_dir_for(first_file)
+        else:
+            base_name, ext = os.path.splitext(os.path.basename(input_file))
+            out_dir = self._output_dir_for(input_file)
+            if "提取" in mode:
+                ext = ".mka"
+            elif "转码" in mode or "压缩" in mode:
+                ext = ".mp4"
+
+        if not out_dir:
+            return ""
+        return os.path.normpath(os.path.join(out_dir, f"{base_name}{suffix}{ext}"))
+
+    def _is_task_finished(self, expected_path):
+        """该文件是否已经跑过（成功、失败、正在处理都算有明确去向）"""
+        if not expected_path:
+            return False
+
+        if os.path.exists(expected_path):
+            return True
+
+        worker = getattr(self, "worker", None)
+        if worker is not None:
+            current = getattr(worker, "current_output", "")
+            if current and os.path.normpath(current) == expected_path:
+                return True
+            for r in getattr(worker, "results", []) or []:
+                if os.path.normpath(r.get("output", "")) == expected_path:
+                    return True
+        return False
+
+    def open_output_folder(self):
+        """打开输出文件夹：优先按列表中选中的文件定位"""
+        if self.file_list.count() == 0:
+            QMessageBox.warning(self, "提示", "列表中没有文件，请先添加媒体文件。")
             return
 
-        # 输出到源文件目录：取列表里第一个文件的所在目录
-        if self.file_list.count() > 0:
-            first_file = self.file_list.item(0).text()
-            out_dir = os.path.dirname(first_file)
-            if out_dir and os.path.isdir(out_dir):
-                os.startfile(out_dir)
+        selected = self.file_list.selectedItems()
+        target = ""
+        if selected:
+            current = self.file_list.currentItem()
+            target = current.text() if current in selected else selected[0].text()
+
+        if target:
+            out_dir = self._output_dir_for(target)
+            if not out_dir or not os.path.isdir(out_dir):
+                QMessageBox.warning(self, "提示", "输出目录不存在，请检查输出设置。")
                 return
 
-        QMessageBox.warning(self, "提示", "请先添加文件或指定输出目录")
+            expected = self._expected_output_path(target)
+            if not self._is_task_finished(expected):
+                box = QMessageBox(self)
+                box.setWindowTitle("尚未处理")
+                box.setIcon(QMessageBox.Question)
+                box.setText(f"「{os.path.basename(target)}」还没有处理结果。")
+                box.setInformativeText(
+                    f"是否打开它将要输出的目录？\n{out_dir}"
+                )
+                btn_yes = box.addButton("确认", QMessageBox.AcceptRole)
+                box.addButton("取消", QMessageBox.RejectRole)
+                box.exec_()
+                if box.clickedButton() is not btn_yes:
+                    return
+
+            os.startfile(out_dir)
+            return
+
+        # 没有选中项时退回"当前输出位置"
+        if not self.check_same_dir.isChecked():
+            out_dir = self.edit_out_dir.text().strip()
+        else:
+            out_dir = os.path.dirname(self.file_list.item(0).text())
+
+        if out_dir and os.path.isdir(out_dir):
+            os.startfile(out_dir)
+        else:
+            QMessageBox.warning(self, "提示", "请先添加文件或指定输出目录")
 
     def scan_overhead(self):
         """扫描列表文件的冗余度"""
