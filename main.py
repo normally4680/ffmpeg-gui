@@ -30,9 +30,12 @@ from PyQt5.QtWidgets import (
     QSpinBox,
     QDialog,
     QScrollArea,
+    QTableWidget,
+    QTableWidgetItem,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QIcon
+from string import Template
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPoint
+from PyQt5.QtGui import QIcon, QColor, QPainter, QPixmap, QPen, QPolygon
 
 # 增加这个函数，用于寻找打包后的资源文件
 def resource_path(relative_path):
@@ -145,45 +148,414 @@ class LogView(QTextEdit):
 
 
 # ==========================================
-# 全局样式表
+# 视觉样式：全局统一圆角 + 统一配色
 # ==========================================
-GLOBAL_QSS = """
+# 所有控件共用同一套圆角与边框取值，避免"有的圆有的方"
+RADIUS = 8            # 按钮 / 输入框 / 列表框 / 日志框 / 进度条
+RADIUS_CARD = 10      # 分组卡片（QGroupBox）
+RADIUS_SMALL = 5      # 复选框、列表项等小元素
+
+COLOR_BG = "#F3F5F9"        # 窗口底色
+COLOR_CARD = "#FFFFFF"      # 卡片 / 输入类背景
+COLOR_BORDER = "#DCE2EC"    # 常规边框
+COLOR_BORDER_HOVER = "#B9C4D6"
+COLOR_TEXT = "#1F2430"
+COLOR_MUTED = "#6B7280"
+COLOR_ACCENT = "#0078D4"       # 主题色：焦点、选中、主操作、进度条、勾选框
+COLOR_ACCENT_DARK = "#006CBE"
+COLOR_ACCENT_HOVER = "#1F8ADF"
+COLOR_DANGER = "#E5484D"       # 停止
+COLOR_DANGER_DARK = "#CE3F44"
+
+
+def _ui_icon_dir():
+    """QSS 的 image 只认文件路径，这里把勾选/箭头图标画成 PNG 放到临时目录"""
+    path = os.path.join(tempfile.gettempdir(), "ffmpeg-gui-ui")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _draw_polyline_icon(path, size, points, color, width):
+    """画一条圆头折线图标（勾选、下拉箭头都用它）"""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(QColor(color))
+    pen.setWidth(width)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.drawPolyline(QPolygon([QPoint(x, y) for x, y in points]))
+    painter.end()
+    pm.save(path, "PNG")
+
+
+def _draw_triangle_icon(path, size, points, color):
+    """画一个实心小三角，用于数字框的加减按钮"""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor(color))
+    painter.drawPolygon(QPolygon([QPoint(x, y) for x, y in points]))
+    painter.end()
+    pm.save(path, "PNG")
+
+
+def build_stylesheet():
+    """生成全局 QSS（图标路径在运行时确定，方便单文件打包）"""
+    icon_dir = _ui_icon_dir()
+    icons = {
+        "check": ("check.png", lambda p: _draw_polyline_icon(
+            p, 32, [(7, 17), (13, 23), (25, 9)], "#FFFFFF", 5)),
+        "chevron": ("chevron.png", lambda p: _draw_polyline_icon(
+            p, 24, [(6, 9), (12, 15), (18, 9)], COLOR_MUTED, 3)),
+        "up": ("arrow-up.png", lambda p: _draw_triangle_icon(
+            p, 12, [(2, 8), (10, 8), (6, 3)], "#374151")),
+        "down": ("arrow-down.png", lambda p: _draw_triangle_icon(
+            p, 12, [(2, 4), (10, 4), (6, 9)], "#374151")),
+    }
+    values = {
+        "bg": COLOR_BG, "card": COLOR_CARD, "border": COLOR_BORDER,
+        "border_hover": COLOR_BORDER_HOVER, "text": COLOR_TEXT,
+        "muted": COLOR_MUTED, "accent": COLOR_ACCENT,
+        "accent_hover": COLOR_ACCENT_HOVER, "accent_dark": COLOR_ACCENT_DARK,
+        "danger": COLOR_DANGER, "danger_dark": COLOR_DANGER_DARK,
+        "r": f"{RADIUS}px", "rc": f"{RADIUS_CARD}px", "rs": f"{RADIUS_SMALL}px",
+        "r_inner": f"{max(RADIUS - 2, 2)}px",
+    }
+    for key, (filename, painter) in icons.items():
+        path = os.path.join(icon_dir, filename)
+        # 每次都重画：成本极低（4 张小图），可避免旧版本残留的图标被复用
+        try:
+            painter(path)
+        except Exception:
+            pass
+        values[key] = path.replace("\\", "/")
+    return Template(QSS_TEMPLATE).substitute(values)
+
+
+QSS_TEMPLATE = """
 QWidget {
     font-family: "Microsoft YaHei", "微软雅黑", sans-serif;
     font-size: 14px;
+    color: $text;
 }
+QMainWindow, QDialog, QMessageBox {
+    background-color: $bg;
+}
+QToolTip {
+    background-color: #2B3243;
+    color: #FFFFFF;
+    border: none;
+    border-radius: $rs;
+    padding: 6px 9px;
+}
+
+/* ---------- 分组卡片 ---------- */
 QGroupBox {
-    font-size: 15px;
+    background-color: $card;
+    border: 1px solid $border;
+    border-radius: $rc;
+    margin-top: 0px;
+    padding: 24px 10px 8px 10px;
+    font-size: 14px;
     font-weight: bold;
-    margin-top: 12px;
-    padding-top: 8px;
+    color: $text;
 }
 QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 10px;
-    padding: 0 5px;
+    subcontrol-origin: padding;
+    subcontrol-position: top left;
+    left: 12px;
+    top: 6px;
+    padding: 0px;
+    background-color: transparent;
+    color: $text;
 }
-QLineEdit, QComboBox {
-    padding: 6px 8px;
+
+/* ---------- 输入类控件 ---------- */
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QAbstractSpinBox {
+    background-color: $card;
+    border: 1px solid $border;
+    border-radius: $r;
+    padding: 4px 8px;
     min-height: 20px;
+    color: $text;
+    selection-background-color: $accent;
+    selection-color: #FFFFFF;
 }
+QLineEdit:hover, QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover {
+    border-color: $border_hover;
+}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+    border: 1px solid $accent;
+}
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {
+    background-color: #F2F4F8;
+    border-color: #E4E9F1;
+    color: #9AA3B2;
+}
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 24px;
+    border: none;
+    background: transparent;
+}
+QComboBox::down-arrow {
+    image: url($chevron);
+    width: 11px;
+    height: 11px;
+}
+QComboBox QAbstractItemView {
+    background-color: $card;
+    border: 1px solid $border;
+    border-radius: $r;
+    padding: 4px;
+    outline: none;
+    selection-background-color: #E5F2FB;
+    selection-color: $text;
+}
+QSpinBox::up-button, QDoubleSpinBox::up-button {
+    subcontrol-origin: border;
+    subcontrol-position: top right;
+    width: 20px;
+    margin: 3px 3px 0px 0px;
+    border: none;
+    border-top-right-radius: $r_inner;
+    background: transparent;
+}
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    subcontrol-origin: border;
+    subcontrol-position: bottom right;
+    width: 20px;
+    margin: 0px 3px 3px 0px;
+    border: none;
+    border-bottom-right-radius: $r_inner;
+    background: transparent;
+}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover,
+QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
+    background-color: #EAF3FC;
+}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    image: url($up);
+    width: 10px;
+    height: 7px;
+}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    image: url($down);
+    width: 10px;
+    height: 7px;
+}
+/* ---------- 按钮 ---------- */
 QPushButton {
-    padding: 6px 14px;
+    background-color: $card;
+    border: 1px solid $border;
+    border-radius: $r;
+    padding: 5px 14px;
     min-height: 20px;
+    color: $text;
+}
+QPushButton:hover {
+    background-color: #F3F9FE;
+    border-color: $border_hover;
+}
+QPushButton:pressed {
+    background-color: #E1F1FB;
+}
+QPushButton:disabled {
+    background-color: #F2F4F8;
+    border-color: #E6EAF2;
+    color: #A8B0BE;
+}
+QPushButton#primaryButton {
+    background-color: $accent;
+    border: 1px solid $accent_dark;
+    color: #FFFFFF;
+    font-weight: bold;
+}
+QPushButton#primaryButton:hover {
+    background-color: $accent_hover;
+    border-color: $accent_dark;
+}
+QPushButton#primaryButton:pressed {
+    background-color: $accent_dark;
+}
+QPushButton#primaryButton:disabled {
+    background-color: #E8EDF4;
+    border-color: #E1E7F0;
+    color: #A8B0BE;
+}
+QPushButton#dangerButton {
+    background-color: $danger;
+    border: 1px solid $danger_dark;
+    color: #FFFFFF;
+    font-weight: bold;
+}
+QPushButton#dangerButton:hover {
+    background-color: #EB5A5F;
+    border-color: $danger_dark;
+}
+QPushButton#dangerButton:pressed {
+    background-color: $danger_dark;
+}
+QPushButton#dangerButton:disabled {
+    background-color: #E8EDF4;
+    border-color: #E1E7F0;
+    color: #A8B0BE;
+}
+
+/* ---------- 列表 / 文本 / 表格 ---------- */
+QListWidget, QTextEdit, QPlainTextEdit, QTableWidget, QScrollArea {
+    background-color: $card;
+    border: 1px solid $border;
+    border-radius: $r;
 }
 QListWidget {
     padding: 4px;
+    outline: none;
 }
-QTextEdit {
+QTextEdit, QPlainTextEdit {
+    padding: 6px;
     font-size: 13px;
-    padding: 4px;
 }
+QListWidget::item {
+    padding: 4px 6px;
+    border-radius: $rs;
+}
+QListWidget::item:hover {
+    background-color: #F3F9FE;
+}
+QListWidget::item:selected {
+    background-color: #E5F2FB;
+    color: $text;
+}
+QScrollArea > QWidget > QWidget {
+    background: transparent;
+}
+QTableWidget {
+    gridline-color: #EDF1F7;
+    selection-background-color: #E5F2FB;
+    selection-color: $text;
+}
+QTableWidget::item {
+    /* 只设 padding：同时设 border 会让 Qt 把单元格文本按单行截断（换行失效） */
+    padding: 4px 6px;
+}
+QHeaderView::section {
+    background-color: #F7F9FC;
+    color: $muted;
+    border: none;
+    border-bottom: 1px solid #E4E9F1;
+    padding: 6px 8px;
+    font-weight: bold;
+}
+QTableCornerButton::section {
+    background-color: #F7F9FC;
+    border: none;
+}
+
+/* ---------- 复选框 ---------- */
 QCheckBox {
-    spacing: 6px;
+    spacing: 7px;
+    background: transparent;
 }
+QCheckBox:disabled {
+    color: #A8B0BE;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid #C6D0DF;
+    border-radius: $rs;
+    background-color: $card;
+}
+QCheckBox::indicator:hover {
+    border-color: $accent;
+}
+QCheckBox::indicator:checked {
+    background-color: $accent;
+    border-color: $accent;
+    image: url($check);
+}
+QCheckBox::indicator:checked:hover {
+    background-color: $accent_hover;
+    border-color: $accent_hover;
+}
+QCheckBox::indicator:disabled {
+    background-color: #F2F4F8;
+    border-color: #E4E9F1;
+}
+QCheckBox::indicator:checked:disabled {
+    background-color: #A9CBEA;
+    border-color: #A9CBEA;
+}
+
+/* ---------- 进度条 ---------- */
 QProgressBar {
+    background-color: #EDF1F7;
+    border: 1px solid $border;
+    border-radius: $r;
     min-height: 22px;
     text-align: center;
+    color: $text;
+    font-size: 12px;
+}
+QProgressBar::chunk {
+    background-color: $accent;
+    border-radius: $r_inner;
+    margin: 1px;
+}
+
+/* ---------- 滚动条 ---------- */
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 2px 2px 2px 0px;
+}
+QScrollBar::handle:vertical {
+    background-color: #C9D2E0;
+    border-radius: 4px;
+    min-height: 30px;
+}
+QScrollBar::handle:vertical:hover {
+    background-color: #AEBACD;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
+}
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 0px 2px 2px 2px;
+}
+QScrollBar::handle:horizontal {
+    background-color: #C9D2E0;
+    border-radius: 4px;
+    min-width: 30px;
+}
+QScrollBar::handle:horizontal:hover {
+    background-color: #AEBACD;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0px;
+}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background: transparent;
+}
+
+/* ---------- 其余容器 ---------- */
+QLabel {
+    background: transparent;
+}
+QSplitter::handle {
+    background-color: transparent;
 }
 """
 
@@ -228,6 +600,46 @@ def subtitle_codec_allowed(container_ext, codec):
         return False
     allowed = CONTAINER_SUB_CODECS[container_ext]
     return True if allowed is None else codec in allowed
+
+
+# ==========================================
+# 智能压缩：bpp 预筛
+# ==========================================
+SMART_BPP_SKIP = 0.090      # H.264 基准：低于此值视为已压得足够
+SMART_BPP_REVIEW = 0.100    # H.264 基准：边缘区上限
+
+# 编码效率系数（相对 H.264）。>1 表示更高效：同 bpp 画质更好，门槛上调、更倾向跳过
+SMART_CODEC_FACTORS = {
+    "h264": 1.00, "avc": 1.00,
+    "hevc": 1.10, "h265": 1.10,
+    "av1": 1.15,
+    "vp9": 1.10,
+    "vp8": 1.05,
+    "mpeg4": 0.85,
+    "mpeg2video": 0.75,
+    "mpeg1video": 0.70,
+    "h263": 0.70,
+    "wmv2": 0.70, "wmv3": 0.70,
+    "prores": 0.0, "dnxhd": 0.0, "ffv1": 0.0, "rawvideo": 0.0, "v210": 0.0,
+}
+
+
+def parse_frame_rate(value):
+    """把 30000/1001 这类帧率字符串转成浮点，失败返回 0"""
+    try:
+        num, den = str(value).split("/")
+        fps = float(num) / float(den)
+        return fps if fps > 0 else 0.0
+    except (ValueError, ZeroDivisionError, AttributeError):
+        return 0.0
+
+
+def smart_thresholds(codec_name, encoder_tag=""):
+    """返回 (系数, 跳过阈值, 边缘上限)；x265 源再上调一档，避免同参重压"""
+    factor = SMART_CODEC_FACTORS.get((codec_name or "").lower(), 1.0)
+    if "x265" in (encoder_tag or "").lower():
+        factor *= 1.15
+    return factor, SMART_BPP_SKIP * factor, SMART_BPP_REVIEW * factor
 
 
 def build_ext_filter(name, exts):
@@ -1053,6 +1465,7 @@ class TrackDialog(QDialog):
         self.btn_all = QPushButton("全选")
         self.btn_none = QPushButton("全不选")
         self.btn_ok = QPushButton("确定")
+        self.btn_ok.setObjectName("primaryButton")
         self.btn_ok.setEnabled(False)
         self.btn_cancel = QPushButton("取消")
         btn_row.addWidget(self.btn_all)
@@ -1248,6 +1661,380 @@ class TrackDialog(QDialog):
             self._worker.wait(3000)
         super().closeEvent(event)
 
+
+class SmartScanWorker(QThread):
+    """后台计算 bpp。接口与 FFmpegWorker 对齐，便于复用暂停 / 停止按钮。"""
+    progress_signal = pyqtSignal(int, int)     # 已检测数, 总数
+    finished_signal = pyqtSignal(list, bool)   # 结果列表, 是否被取消
+
+    def __init__(self, ffprobe_path, files):
+        super().__init__()
+        self.ffprobe_path = ffprobe_path
+        self.files = files
+        self.is_paused = False
+        self.is_stopped = False
+        self.results = []
+
+    def pause_process(self):
+        self.is_paused = True
+
+    def resume_process(self):
+        self.is_paused = False
+
+    def stop_process(self):
+        self.is_stopped = True
+        self.is_paused = False
+
+    def _paused_gate(self):
+        while self.is_paused and not self.is_stopped:
+            time.sleep(0.1)
+        return not self.is_stopped
+
+    def run(self):
+        total = len(self.files)
+        results = []
+        for idx, path in enumerate(self.files):
+            if not self._paused_gate():
+                break
+            results.append(self.scan_one(path))
+            self.progress_signal.emit(idx + 1, total)
+        self.results = results
+        self.finished_signal.emit(results, self.is_stopped)
+
+    def scan_one(self, path):
+        item = {
+            "path": path,
+            "name": os.path.basename(path),
+            "ok": False,
+            "reason": "",
+            "codec": "",
+            "encoder": "",
+            "width": 0,
+            "height": 0,
+            "fps": 0.0,
+            "bitrate": 0,
+            "bitrate_source": "",
+            "bpp": 0.0,
+            "factor": 1.0,
+            "skip": SMART_BPP_SKIP,
+            "review": SMART_BPP_REVIEW,
+            "verdict": "error",
+        }
+
+        if not self.ffprobe_path:
+            item["reason"] = "未找到 ffprobe"
+            return item
+
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            cmd = [
+                self.ffprobe_path, "-v", "error",
+                "-print_format", "json",
+                "-show_streams", "-show_format",
+                path,
+            ]
+            res = subprocess.run(
+                cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="ignore", check=True,
+                timeout=20, startupinfo=startupinfo,
+            )
+            data = json.loads(res.stdout)
+        except subprocess.CalledProcessError:
+            item["reason"] = "无法读取（损坏/不支持）"
+            return item
+        except Exception as e:
+            item["reason"] = f"读取失败：{e}"
+            return item
+
+        video = None
+        for s in data.get("streams", []):
+            disp = s.get("disposition", {}) or {}
+            if s.get("codec_type") == "video" and not disp.get("attached_pic"):
+                video = s
+                break
+        if video is None:
+            item["reason"] = "没有视频流"
+            return item
+
+        fmt = data.get("format", {}) or {}
+        width = int(video.get("width") or 0)
+        height = int(video.get("height") or 0)
+        fps = (parse_frame_rate(video.get("r_frame_rate"))
+               or parse_frame_rate(video.get("avg_frame_rate")))
+
+        vbitrate = self._int(video.get("bit_rate"))
+        source = "视频流码率"
+        if vbitrate <= 0:
+            total_rate = self._int(fmt.get("bit_rate"))
+            if total_rate <= 0:
+                size = self._int(fmt.get("size"))
+                duration = self._float(fmt.get("duration"))
+                if size > 0 and duration > 0:
+                    total_rate = int(size * 8 / duration)
+            audio_rate = 0
+            for s in data.get("streams", []):
+                if s.get("codec_type") == "audio":
+                    audio_rate += self._int(s.get("bit_rate"))
+            if total_rate > 0:
+                if 0 < audio_rate < total_rate:
+                    vbitrate = total_rate - audio_rate
+                    source = "总码率减音频"
+                else:
+                    vbitrate = total_rate
+                    source = "总码率估算"
+
+        item.update({
+            "codec": video.get("codec_name", "未知"),
+            "encoder": (video.get("tags", {}) or {}).get("encoder", ""),
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "bitrate": vbitrate,
+            "bitrate_source": source,
+        })
+
+        if width <= 0 or height <= 0:
+            item["reason"] = "分辨率无效"
+            return item
+        if fps <= 0:
+            item["reason"] = "帧率无效（可能是 VFR）"
+            return item
+        if vbitrate <= 0:
+            item["reason"] = "无法获取视频码率"
+            return item
+
+        bpp = vbitrate / (width * height * fps)
+        factor, skip, review = smart_thresholds(item["codec"], item["encoder"])
+        if bpp < skip:
+            verdict = "skip"
+        elif bpp < review:
+            verdict = "review"
+        else:
+            verdict = "ok"
+
+        item.update({
+            "ok": True,
+            "bpp": bpp,
+            "factor": factor,
+            "skip": skip,
+            "review": review,
+            "verdict": verdict,
+        })
+        return item
+
+    @staticmethod
+    def _int(value):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+
+class SmartScanDialog(QDialog):
+    """bpp 检测结果：勾选要送去压缩的文件"""
+
+    VERDICT_TEXT = {"ok": "可压", "review": "边缘", "skip": "跳过", "error": "检测失败"}
+    VERDICT_COLOR = {"ok": "#1D9E75", "review": "#BA7517", "skip": "#888780", "error": "#A32D2D"}
+    ORDER = {"ok": 0, "review": 1, "skip": 2, "error": 3}
+
+    def __init__(self, results, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("bpp 检测结果")
+        self.resize(1000, 540)
+        self.setMinimumSize(860, 440)
+
+        self.results = sorted(
+            results, key=lambda r: (self.ORDER[r["verdict"]], -r["bpp"])
+        )
+        self._loading = True
+        self.check_boxes = {}      # 行号 -> QCheckBox
+
+        outer = QVBoxLayout(self)
+        outer.setSpacing(8)
+
+        title = QLabel(
+            "共检测 {} 个文件：可压 {} ｜ 边缘 {} ｜ 跳过 {} ｜ 失败 {}".format(
+                len(results), self._count("ok"), self._count("review"),
+                self._count("skip"), self._count("error"),
+            )
+        )
+        title.setStyleSheet("font-weight: bold;")
+        outer.addWidget(title)
+
+        hint = QLabel(
+            "bpp = 视频码率 ÷ (宽 × 高 × 帧率)，数值越低说明源片压得越充分。\n"
+            "跳过阈值按编码器折算：H.264 < {:.3f}、HEVC < {:.3f}、AV1 < {:.3f}；"
+            "边缘区为阈值至 {:.3f}（H.264）。\n"
+            "默认只勾选「可压」的文件，边缘和跳过的文件可以手动勾选。".format(
+                SMART_BPP_SKIP, SMART_BPP_SKIP * 1.10,
+                SMART_BPP_SKIP * 1.15, SMART_BPP_REVIEW,
+            )
+        )
+        hint.setStyleSheet("color: #666;")
+        outer.addWidget(hint)
+
+        self.table = QTableWidget(len(self.results), 7)
+        self.table.setHorizontalHeaderLabels(
+            ["选择", "文件", "编码 / 分辨率 / 帧率", "视频码率", "bpp", "判定", "说明"]
+        )
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionMode(QTableWidget.NoSelection)
+        self.table.setWordWrap(True)
+        # 表格只用于勾选，不需要焦点框（否则单元格会套一圈虚线）
+        self.table.setFocusPolicy(Qt.NoFocus)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setColumnWidth(0, 52)
+        self.table.setColumnWidth(1, 330)
+        self.table.setColumnWidth(2, 190)
+        self.table.setColumnWidth(3, 95)
+        self.table.setColumnWidth(4, 70)
+        self.table.setColumnWidth(5, 70)
+
+        for row, r in enumerate(self.results):
+            self._add_row(row, r)
+        self._loading = False
+        outer.addWidget(self.table, 1)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("显示："))
+        self.combo_filter = QComboBox()
+        self.combo_filter.addItems(["全部", "仅建议压缩", "仅边缘", "仅跳过", "仅检测失败"])
+        self.combo_filter.currentIndexChanged.connect(self._apply_filter)
+        filter_row.addWidget(self.combo_filter)
+        filter_row.addStretch()
+        self.lbl_count = QLabel()
+        filter_row.addWidget(self.lbl_count)
+        outer.addLayout(filter_row)
+
+        btn_row = QHBoxLayout()
+        self.btn_all = QPushButton("全选")
+        self.btn_none = QPushButton("全不选")
+        self.btn_suggest = QPushButton("仅选建议压缩")
+        self.btn_cancel = QPushButton("取消")
+        self.btn_add = QPushButton("一键添加")
+        self.btn_add.setObjectName("primaryButton")
+        btn_row.addWidget(self.btn_all)
+        btn_row.addWidget(self.btn_none)
+        btn_row.addWidget(self.btn_suggest)
+        btn_row.addStretch()
+        btn_row.addWidget(self.btn_cancel)
+        btn_row.addWidget(self.btn_add)
+        outer.addLayout(btn_row)
+
+        self.btn_all.clicked.connect(lambda: self._set_all(True))
+        self.btn_none.clicked.connect(lambda: self._set_all(False))
+        self.btn_suggest.clicked.connect(self._set_suggest)
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_add.clicked.connect(self.accept)
+
+        self._update_count()
+
+    def _count(self, verdict):
+        return sum(1 for r in self.results if r["verdict"] == verdict)
+
+    def _add_row(self, row, r):
+        # 用真实的 QCheckBox 而非表格项自带的勾选框：表格项勾选框一旦加样式，
+        # Qt 会把同行文本按单行截断（路径显示不全），改用控件可以两者兼得
+        check = QCheckBox()
+        check.setChecked(bool(r["ok"]) and r["verdict"] == "ok")
+        check.setEnabled(bool(r["ok"]))
+        check.stateChanged.connect(self._update_count)
+        holder = QWidget()
+        holder_layout = QHBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        holder_layout.setAlignment(Qt.AlignCenter)
+        holder_layout.addWidget(check)
+        self.table.setCellWidget(row, 0, holder)
+        self.check_boxes[row] = check
+
+        name = QTableWidgetItem("{}\n{}".format(r["name"], os.path.dirname(r["path"])))
+        name.setToolTip(r["path"])
+        self.table.setItem(row, 1, name)
+
+        if r["ok"]:
+            codec = r["codec"]
+            tech = "{} · {}×{} · {:.2f}fps".format(
+                codec, r["width"], r["height"], r["fps"]
+            )
+            if r["verdict"] == "review":
+                note = "阈值区间 {:.3f}–{:.3f}，可手动勾选".format(r["skip"], r["review"])
+            elif r["verdict"] == "skip":
+                note = "低于 {:.3f}，压缩收益小".format(r["skip"])
+            else:
+                note = "高于 {:.3f}，推荐压缩".format(r["review"])
+        else:
+            tech = "—"
+            note = r["reason"]
+        self.table.setItem(row, 2, QTableWidgetItem(tech))
+
+        rate = "{:.2f} Mbps".format(r["bitrate"] / 1e6) if r["bitrate"] else "—"
+        rate_item = QTableWidgetItem(rate)
+        rate_item.setToolTip("码率来源：" + (r["bitrate_source"] or "未知"))
+        self.table.setItem(row, 3, rate_item)
+
+        bpp_item = QTableWidgetItem("{:.4f}".format(r["bpp"]) if r["ok"] else "—")
+        bpp_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.table.setItem(row, 4, bpp_item)
+
+        verdict = QTableWidgetItem(self.VERDICT_TEXT[r["verdict"]])
+        verdict.setForeground(QColor(self.VERDICT_COLOR[r["verdict"]]))
+        verdict.setToolTip(note)
+        self.table.setItem(row, 5, verdict)
+
+        note_item = QTableWidgetItem(note)
+        note_item.setToolTip(note)
+        if not r["ok"]:
+            note_item.setForeground(QColor(self.VERDICT_COLOR["error"]))
+        self.table.setItem(row, 6, note_item)
+
+        self.table.setRowHeight(row, 44)
+
+    def _apply_filter(self):
+        mode = self.combo_filter.currentIndex()
+        wanted = {0: None, 1: "ok", 2: "review", 3: "skip", 4: "error"}[mode]
+        for row, r in enumerate(self.results):
+            self.table.setRowHidden(row, wanted is not None and r["verdict"] != wanted)
+
+    def _set_all(self, checked):
+        for row, r in enumerate(self.results):
+            if not r["ok"]:
+                continue
+            self.check_boxes[row].setChecked(checked)
+        self._update_count()
+
+    def _set_suggest(self):
+        for row, r in enumerate(self.results):
+            if not r["ok"]:
+                continue
+            self.check_boxes[row].setChecked(r["verdict"] == "ok")
+        self._update_count()
+
+    def selected_results(self):
+        chosen = []
+        for row, r in enumerate(self.results):
+            if r["ok"] and self.check_boxes[row].isChecked():
+                chosen.append(r)
+        return chosen
+
+    def selected_files(self):
+        return [r["path"] for r in self.selected_results()]
+
+    def _update_count(self, *_):
+        n = len(self.selected_results())
+        self.lbl_count.setText("已选 {} 个".format(n))
+        self.btn_add.setEnabled(n > 0)
+
+
 # ==========================================
 # 主界面
 # ==========================================
@@ -1264,6 +2051,8 @@ class MainWindow(QMainWindow):
         self._duration_token = 0
         self._track_plan = None       # 轨道管理：当前文件的保留方案
         self._closing = False         # 关闭流程中，避免收尾弹窗打断退出
+        self._smart_scanned = False   # 智能压缩：当前列表是否已完成 bpp 筛选
+        self.scan_worker = None
         self.log_writer = LogFileWriter()
 
         self.init_ui()
@@ -1343,6 +2132,7 @@ class MainWindow(QMainWindow):
                 "修复视频索引 (无编码 Remux)",
                 "轨道管理 (删除音轨/字幕轨)",
                 "极简压缩 (H.265, CRF23)",
+                "智能压缩 (bpp 预筛)",
                 "视频转码为 MP4 (H.264)",
             ]
         )
@@ -1457,9 +2247,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
 
         self.btn_run = QPushButton("开始批量处理")
-        self.btn_run.setStyleSheet(
-            "font-weight: bold; background-color: #4CAF50; color: white;"
-        )
+        self.btn_run.setObjectName("primaryButton")
         self.btn_run.setFixedHeight(40)
 
         # --- 新增：暂停和停止按钮 ---
@@ -1469,7 +2257,7 @@ class MainWindow(QMainWindow):
 
         self.btn_stop = QPushButton("⏹ 停止")
         self.btn_stop.setFixedHeight(40)
-        self.btn_stop.setStyleSheet("background-color: #f44336; color: white;") # 红色警示
+        self.btn_stop.setObjectName("dangerButton")   # 红色警示
         self.btn_stop.setEnabled(False)
         # ---------------------------
 
@@ -1597,6 +2385,8 @@ class MainWindow(QMainWindow):
 
     def update_mode_params(self, index):
         mode = self.combo_mode.currentText()
+        # 切换模式后，之前的 bpp 筛选结果不再适用
+        self._smart_scanned = False
 
         # 隐藏所有动态参数 (加入新增的控件)
         for w in [
@@ -1624,6 +2414,13 @@ class MainWindow(QMainWindow):
             self.spin_crf.show()
             self.check_nvenc.show()
             self.check_qsv.show()
+        elif "智能压缩" in mode:
+            # 智能压缩固定 CPU 软编，不显示显卡选项；CRF 默认 22
+            self.check_smart_audio.show()
+            self.lbl_crf.show()
+            self.spin_crf.show()
+            if self.spin_crf.value() == 23:
+                self.spin_crf.setValue(22)
         elif "视频转码" in mode:
             self.lbl_crf.show()
             self.spin_crf.show()
@@ -1724,8 +2521,10 @@ class MainWindow(QMainWindow):
                 existing.add(f)
                 added += 1
 
-        if added > 0 and not self.file_list.selectedItems():
-            self.file_list.setCurrentRow(0)
+        if added > 0:
+            self._smart_scanned = False
+            if not self.file_list.selectedItems():
+                self.file_list.setCurrentRow(0)
 
         return added
 
@@ -1826,10 +2625,12 @@ class MainWindow(QMainWindow):
     def remove_selected(self):
         for item in self.file_list.selectedItems():
             self.file_list.takeItem(self.file_list.row(item))
+        self._smart_scanned = False
         self._update_track_button_state()
 
     def clear_files(self):
         self.file_list.clear()
+        self._smart_scanned = False
         self._update_track_button_state()
 
     def select_subtitle(self):
@@ -1910,6 +2711,44 @@ class MainWindow(QMainWindow):
 
         return [(cmd, output_file)]
 
+    def _build_smart_tasks(self, suffix, crf_val):
+        """智能压缩：按极简压缩的 CPU 参数生成任务（列表已由 bpp 筛选）"""
+        if not self._smart_scanned:
+            QMessageBox.warning(
+                self, "提示", "请先点击「开始批量处理」完成 bpp 检测与筛选。"
+            )
+            return []
+        if self.file_list.count() == 0:
+            QMessageBox.warning(self, "提示", "列表中没有文件，请先检测并选择要压缩的项目。")
+            return []
+
+        tasks = []
+        for i in range(self.file_list.count()):
+            input_file = self.file_list.item(i).text()
+            base_name, _ = os.path.splitext(os.path.basename(input_file))
+            out_dir = self._output_dir_for(input_file)
+            if not out_dir:
+                QMessageBox.warning(self, "错误", "请选择输出目录！")
+                return []
+
+            output_file = os.path.normpath(
+                os.path.join(out_dir, f"{base_name}{suffix}.mp4")
+            )
+            cmd = [
+                self.ffmpeg_path, "-y", "-i", input_file,
+                "-c:v", "libx265", "-preset", "medium", "-crf", crf_val,
+                "-x265-params", "log-level=error",
+                "-pix_fmt", "yuv420p", "-tag:v", "hvc1",
+            ]
+            if self.check_smart_audio.isChecked():
+                cmd.append("__SMART_AUDIO__")
+            else:
+                cmd.extend(["-c:a", "copy"])
+            cmd.extend(["-movflags", "+faststart", output_file])
+            tasks.append((cmd, output_file))
+
+        return tasks
+
     def generate_tasks(self):
         """生成所有执行任务"""
         tasks = []
@@ -1922,6 +2761,10 @@ class MainWindow(QMainWindow):
         # ============ 特例：轨道管理（单文件，删除指定音轨/字幕轨） ============
         if "轨道" in mode:
             return self._build_track_tasks(suffix)
+
+        # ============ 智能压缩：列表已由 bpp 筛选，CPU H.265 ============
+        if "智能压缩" in mode:
+            return self._build_smart_tasks(suffix, crf_val)
 
         # ============ 特例：无编码合并视频 ============
         if "无编码合并" in mode:
@@ -2154,6 +2997,11 @@ class MainWindow(QMainWindow):
             self.edit_suffix.selectAll()
             return
 
+        # 智能压缩：第一次点击先做 bpp 检测，筛选完成后再次点击才真正压缩
+        if "智能压缩" in self.combo_mode.currentText() and not self._smart_scanned:
+            self.start_smart_scan()
+            return
+
         tasks = self.generate_tasks()
         if not tasks:
             return
@@ -2173,6 +3021,110 @@ class MainWindow(QMainWindow):
         self.worker.log_signal.connect(self.append_log)
         self.worker.finished_signal.connect(self.processing_finished)
         self.worker.start()
+
+    def start_smart_scan(self):
+        """智能压缩第一步：后台检测 bpp"""
+        files = [self.file_list.item(i).text() for i in range(self.file_list.count())]
+        if not files:
+            return
+
+        self._set_list_busy(True)
+        self.btn_run.setEnabled(False)
+        self.btn_pause.setEnabled(True)
+        self.btn_pause.setText("⏸ 暂停")
+        self.btn_stop.setEnabled(True)
+        self.progress_bar.setRange(0, len(files))
+        self.progress_bar.setValue(0)
+        self.log_text.append(f"\n🔍 开始 bpp 检测：{len(files)} 个文件…")
+
+        self.scan_worker = SmartScanWorker(self.ffprobe_path, files)
+        self.scan_worker.progress_signal.connect(self._on_scan_progress)
+        self.scan_worker.finished_signal.connect(self._on_scan_finished)
+        self.worker = self.scan_worker   # 复用暂停 / 停止 / 关闭确认
+        self.scan_worker.start()
+
+    def _set_list_busy(self, busy):
+        """扫描期间锁住列表与模式，避免边扫边改导致结果错位"""
+        for w in (
+            self.file_list, self.combo_mode,
+            self.btn_add_files, self.btn_add_folder,
+            self.btn_remove_selected, self.btn_clear_files,
+            self.btn_media_info, self.btn_scan_overhead,
+        ):
+            w.setEnabled(not busy)
+        if not busy:
+            self._update_track_button_state()
+
+    def _on_scan_progress(self, done, total):
+        self.progress_bar.setValue(done)
+
+    def _on_scan_finished(self, results, cancelled):
+        self._set_list_busy(False)
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setText("⏸ 暂停")
+        self.btn_stop.setEnabled(False)
+        self.btn_run.setEnabled(True)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+
+        if cancelled:
+            self.log_text.append("⏹ bpp 检测已取消，列表保持不变。")
+            return
+        if not results:
+            self.log_text.append("⚠️ 没有可用的检测结果。")
+            return
+
+        self._log_scan_report(results)
+
+        dlg = SmartScanDialog(results, self)
+        if dlg.exec_() != QDialog.Accepted:
+            self.log_text.append("已取消筛选，列表保持不变。")
+            return
+
+        chosen = dlg.selected_files()
+        if not chosen:
+            return
+
+        skipped = sum(1 for r in results if r["verdict"] == "skip")
+        self.file_list.clear()
+        self._add_files_to_list(chosen)
+        self._smart_scanned = True
+        self.log_text.append(
+            "✅ 已用 {} 个文件替换列表（跳过 {} 个，源文件保持原位），"
+            "点击「开始批量处理」开始压缩。".format(len(chosen), skipped)
+        )
+
+    def _log_scan_report(self, results):
+        ok = [r for r in results if r["verdict"] == "ok"]
+        review = [r for r in results if r["verdict"] == "review"]
+        skip = [r for r in results if r["verdict"] == "skip"]
+        error = [r for r in results if r["verdict"] == "error"]
+
+        self.log_text.append(
+            "\n📋 bpp 检测完成：共 {} 个 ｜ 可压 {} ｜ 边缘 {} ｜ 跳过 {} ｜ 失败 {}".format(
+                len(results), len(ok), len(review), len(skip), len(error)
+            )
+        )
+
+        def fmt(r):
+            if r["ok"]:
+                return (
+                    "  • {}  bpp {:.4f}  {} {}×{} {:.2f}fps  {:.2f} Mbps".format(
+                        r["path"], r["bpp"], r["codec"], r["width"],
+                        r["height"], r["fps"], r["bitrate"] / 1e6,
+                    )
+                )
+            return "  • {}  检测失败：{}".format(r["path"], r["reason"])
+
+        for title, group in (
+            ("✅ 可压", ok), ("⚠️ 边缘", review),
+            ("⏭ 跳过", skip), ("❌ 失败", error),
+        ):
+            if not group:
+                continue
+            self.log_text.append(title + "：")
+            for r in group:
+                self.log_text.append(fmt(r))
 
     def log_subtitle_hint(self):
         """字幕封装到 MP4 时提示样式丢失（只写日志，不打断批量任务）"""
@@ -2318,7 +3270,10 @@ class MainWindow(QMainWindow):
             self.worker.stop_process()
             self.btn_pause.setEnabled(False)
             self.btn_stop.setEnabled(False)
-            self.log_text.append("⏹ 正在停止当前任务并清理半成品...")
+            if isinstance(self.worker, SmartScanWorker):
+                self.log_text.append("⏹ 正在取消 bpp 检测...")
+            else:
+                self.log_text.append("⏹ 正在停止当前任务并清理半成品...")
 
     def closeEvent(self, event):
         """关闭程序：有任务在跑时二次确认"""
@@ -2328,9 +3283,11 @@ class MainWindow(QMainWindow):
             box.setWindowTitle("正在处理")
             box.setIcon(QMessageBox.Warning)
             box.setText("当前还有任务正在处理。")
-            box.setInformativeText(
-                "退出会立即终止 ffmpeg 进程，并清理未完成的半成品文件。\n\n确定要退出吗？"
-            )
+            if isinstance(worker, SmartScanWorker):
+                tip = "退出会中止正在进行的 bpp 检测。\n\n确定要退出吗？"
+            else:
+                tip = "退出会立即终止 ffmpeg 进程，并清理未完成的半成品文件。\n\n确定要退出吗？"
+            box.setInformativeText(tip)
             btn_quit = box.addButton("确认退出", QMessageBox.DestructiveRole)
             box.addButton("取消", QMessageBox.RejectRole)
             box.exec_()
@@ -2477,11 +3434,11 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     
     # 使用 resource_path 获取正确路径，并且给主窗口也设置一次图标
-    from PyQt5.QtGui import QIcon
+    from PyQt5.QtGui import QIcon, QColor
     icon_path = resource_path("app.ico")
     app.setWindowIcon(QIcon(icon_path))
     
-    app.setStyleSheet(GLOBAL_QSS)
+    app.setStyleSheet(build_stylesheet())
     window = MainWindow()
     window.setWindowIcon(QIcon(icon_path))  # 给窗口单独设置一次
     window.show()
