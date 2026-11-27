@@ -2227,7 +2227,7 @@ class SmartScanDialog(QDialog):
             "bpp = 视频码率 ÷ (宽 × 高 × 帧率)，数值越低说明源片压得越充分。\n"
             "跳过阈值按编码器折算：H.264 < {:.3f}、HEVC < {:.3f}、AV1 < {:.3f}；"
             "边缘区为阈值至 {:.3f}（H.264）。\n"
-            "VFR（可变帧率）视频的 bpp 参考性较差，会标为「待试压」，建议用试压实测压缩比。".format(
+            "VFR（可变帧率）视频的 bpp 参考性较差，会标为「待试压」；勾选后点「试压」可实测压缩比。".format(
                 SMART_BPP_SKIP, SMART_BPP_SKIP * 1.10,
                 SMART_BPP_SKIP * 1.15, SMART_BPP_REVIEW,
             )
@@ -2287,9 +2287,9 @@ class SmartScanDialog(QDialog):
         self.btn_suggest = QPushButton("仅选建议压缩")
         self.btn_trial = QPushButton("🧪 试压")
         self.btn_trial.setToolTip(
-            "对所有 VFR 文件 + 已勾选的文件做抽样试压：\n"
+            "对已勾选的文件做抽样试压：\n"
             "按正式压缩参数各压两段 6 秒短片，估算全片体积。\n"
-            "也可先勾选其它文件，再一起试压。"
+            "VFR 文件默认不勾选，勾上需要验证的条目再点这里。"
         )
         self.btn_cancel = QPushButton("取消")
         self.btn_add = QPushButton("一键添加")
@@ -2382,7 +2382,7 @@ class SmartScanDialog(QDialog):
         if not r.get("ok"):
             return note
         if r.get("vfr"):
-            return "{}（名义 {:.2f}fps / 平均 {:.2f}fps，压缩时规整为 {}fps）".format(
+            return "{}（名义 {:.2f}fps / 平均 {:.2f}fps，压缩时规整为 {}fps）\n勾选后可点「试压」实测压缩比".format(
                 note, r["r_fps"], r["avg_fps"], r["target_fps"]
             )
         return note
@@ -2428,12 +2428,10 @@ class SmartScanDialog(QDialog):
         return bool(self._trial and self._trial.isRunning())
 
     def _trial_targets(self):
-        """试压对象 = 所有 VFR 文件 + 已勾选的文件（便于手动追加验证其它条目）"""
+        """试压对象 = 用户勾选的文件，未勾选的一律不动"""
         rows = []
         for row, r in enumerate(self.results):
-            if not r["ok"] or r.get("trial"):
-                continue
-            if r.get("vfr") or self.check_boxes[row].isChecked():
+            if r["ok"] and not r.get("trial") and self.check_boxes[row].isChecked():
                 rows.append(row)
         return rows
 
@@ -2492,6 +2490,9 @@ class SmartScanDialog(QDialog):
                   self.btn_cancel, self.btn_add):
             w.setEnabled(not running)
         self.combo_filter.setEnabled(not running)
+        # 试压期间锁住勾选框，避免跑到一半改了对象导致数字对不上
+        for row, cb in self.check_boxes.items():
+            cb.setEnabled(self.results[row]["ok"] and not running)
         self.trial_bar.setVisible(running)
         self.lbl_trial.setVisible(running)
         if running:
