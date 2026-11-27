@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import subprocess
 import shutil
 import tempfile
@@ -35,7 +36,7 @@ from PyQt5.QtWidgets import (
 )
 from string import Template
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPoint
-from PyQt5.QtGui import QIcon, QColor, QPainter, QPixmap, QPen, QPolygon
+from PyQt5.QtGui import QIcon, QColor, QPainter, QPixmap, QPen, QPolygon, QTextCursor
 
 # 增加这个函数，用于寻找打包后的资源文件
 def resource_path(relative_path):
@@ -135,16 +136,51 @@ class LogFileWriter:
 
 
 class LogView(QTextEdit):
-    """日志框：append 到界面的同时写入日志文件"""
+    """日志框：append 到界面的同时写入日志文件
+
+    追加时判断滚动条是否停在底部：
+    - 在底部（含几个像素误差）→ 追加后继续贴底，跟随最新日志
+    - 已被用户向上翻阅 → 保持当前视图不动，不把人拽回底部
+    滚回底部后自动恢复跟随，无需额外开关。
+    """
+
+    FOLLOW_TOLERANCE = 6    # 距底部多少像素内仍视为"在跟随"
+    MAX_BLOCKS = 3000       # 界面里最多保留的日志行数，超出丢弃最早的
 
     def __init__(self, writer=None, parent=None):
         super().__init__(parent)
         self._writer = writer
 
     def append(self, text):
+        bar = self.verticalScrollBar()
+        doc = self.document()
+        following = bar.value() >= bar.maximum() - self.FOLLOW_TOLERANCE
+        keep = bar.value()
+
         super().append(text)
         if self._writer:
             self._writer.write(text)
+
+        # 清旧行前记一下文档高度，用于换算视图该往上挪多少
+        height_before_trim = doc.size().height() if not following else 0
+        self._trim()
+
+        if following:
+            bar.setValue(bar.maximum())
+        else:
+            # 从文档开头删掉若干行后，同样的滚动值会往下偏，需要减去被删掉的高度
+            removed = max(height_before_trim - doc.size().height(), 0)
+            bar.setValue(max(int(keep - removed), 0))
+
+    def _trim(self):
+        doc = self.document()
+        extra = doc.blockCount() - self.MAX_BLOCKS
+        if extra <= 0:
+            return
+        cursor = QTextCursor(doc)      # 用独立游标，避免破坏用户正在拖选的文本
+        cursor.movePosition(QTextCursor.Start)
+        cursor.movePosition(QTextCursor.Down, QTextCursor.KeepAnchor, extra)
+        cursor.removeSelectedText()
 
 
 # ==========================================
@@ -625,13 +661,46 @@ SMART_CODEC_FACTORS = {
 
 
 def parse_frame_rate(value):
-    """把 30000/1001 这类帧率字符串转成浮点，失败返回 0"""
+    """把 30000/1001、29.97 这类帧率写法转成浮点，失败返回 0"""
     try:
-        num, den = str(value).split("/")
-        fps = float(num) / float(den)
+        text = str(value).strip()
+        if not text or text in ("0/0", "N/A"):
+            return 0.0
+        if "/" in text:
+            num, den = text.split("/", 1)
+            den = float(den)
+            fps = float(num) / den if den else 0.0
+        else:
+            fps = float(text)
         return fps if fps > 0 else 0.0
     except (ValueError, ZeroDivisionError, AttributeError):
         return 0.0
+
+
+PROGRESS_LINE_RE = re.compile(r"^(frame|size|Lsize)\s*=")
+
+
+def is_progress_line(line):
+    """ffmpeg 的统计行总是以 frame= / size= / Lsize= 开头
+
+    不能用 "size=" in line 判断：`Input #0 ... testsrc2=size=640x480` 这类
+    流信息行也含 size=，会被误当成进度行而被节流吞掉。
+    """
+    return bool(PROGRESS_LINE_RE.match(line.lstrip()))
+
+
+def normalize_progress_line(line):
+    """规整 ffmpeg 进度行的空格：等号后不留空白，连续空白压成一个
+
+    frame=   11 fps=0.0 q=30.0 size=       0KiB
+    → frame=11 fps=0.0 q=30.0 size=0KiB
+
+    只处理进度行，普通日志（含缩进、路径里的空格）原样返回。
+    """
+    if not is_progress_line(line):
+        return line
+    text = " ".join(line.split())
+    return re.sub(r"=\s+", "=", text)
 
 
 def smart_thresholds(codec_name, encoder_tag=""):
@@ -640,6 +709,59 @@ def smart_thresholds(codec_name, encoder_tag=""):
     if "x265" in (encoder_tag or "").lower():
         factor *= 1.15
     return factor, SMART_BPP_SKIP * factor, SMART_BPP_REVIEW * factor
+
+
+# ---- VFR（可变帧率）判定与帧率规整 ----
+SMART_VFR_TOLERANCE = 0.02      # 名义帧率与平均帧率相差超过 2% 视为 VFR
+SMART_TRIAL_SAVING = 0.25       # 试压后预计省下 25% 以上才算"值得压"
+SMART_TRIAL_SECONDS = 6.0       # 单段试压时长
+SMART_TRIAL_POINTS = (0.25, 0.75)   # 采样位置（片长的百分比），避开片头静止画面
+
+_FPS_MODE_SUPPORT = {}
+
+
+def is_vfr(r_fps, avg_fps):
+    """名义帧率与平均帧率明显不一致 → VFR"""
+    if r_fps <= 0 or avg_fps <= 0:
+        return False
+    return abs(r_fps - avg_fps) > max(r_fps, avg_fps) * SMART_VFR_TOLERANCE
+
+
+def derive_target_fps(avg_fps):
+    """按平均帧率把 VFR 规整到常见帧率，避免把 60fps 素材硬砍成 30"""
+    if avg_fps <= 0:
+        return 30
+    if avg_fps < 24.5:
+        return 24
+    if avg_fps < 27:
+        return 25
+    if avg_fps < 45:
+        return 30
+    if avg_fps < 55:
+        return 50
+    return 60
+
+
+def supports_fps_mode(ffmpeg_path):
+    """-fps_mode 是 ffmpeg 5.0 才有的参数，旧版只能用 -r"""
+    if not ffmpeg_path:
+        return False
+    cached = _FPS_MODE_SUPPORT.get(ffmpeg_path)
+    if cached is not None:
+        return cached
+    ok = False
+    try:
+        out = subprocess.run(
+            [ffmpeg_path, "-version"], capture_output=True, text=True,
+            encoding="utf-8", errors="ignore", timeout=15,
+        ).stdout
+        m = re.search(r"ffmpeg version\s+(?:n)?(\d+)", out)
+        if m:
+            ok = int(m.group(1)) >= 5
+    except Exception:
+        ok = False
+    _FPS_MODE_SUPPORT[ffmpeg_path] = ok
+    return ok
 
 
 def build_ext_filter(name, exts):
@@ -924,7 +1046,8 @@ class FFmpegWorker(QThread):
         self.is_paused = False
 
         last_emit = 0
-        last_line = ""
+        last_emitted = ""
+        last_progress = ""
         try:
             for line in self.process.stdout:
                 # 如果中途被强制停止，直接跳出读取循环
@@ -939,12 +1062,15 @@ class FFmpegWorker(QThread):
                     self.log_signal.emit(line)
                     continue
 
-                now = time.time()
-                if ("frame=" in line or "size=" in line or "speed=" in line):
+                if is_progress_line(line):
+                    # 进度行密度高，2 秒才显示一条，避免刷屏
+                    text = normalize_progress_line(line)
+                    last_progress = text
+                    now = time.time()
                     if now - last_emit >= 2.0:
-                        self.log_signal.emit(line)
+                        self.log_signal.emit(text)
                         last_emit = now
-                        last_line = line
+                        last_emitted = text
                 else:
                     self.log_signal.emit(line)
         except Exception as read_err:
@@ -956,8 +1082,9 @@ class FFmpegWorker(QThread):
                 if self.process.stdout:
                     self.process.stdout.close()
 
-        if last_line:
-            self.log_signal.emit(last_line)
+        # 补发最后一条进度（例如收尾的 Lsize 行），已经显示过的不重复打印
+        if last_progress and last_progress != last_emitted:
+            self.log_signal.emit(last_progress)
 
         # 在置空 self.process 之前，先获取 returncode
         return_code = None
@@ -1712,6 +1839,14 @@ class SmartScanWorker(QThread):
             "width": 0,
             "height": 0,
             "fps": 0.0,
+            "r_fps": 0.0,
+            "avg_fps": 0.0,
+            "vfr": False,
+            "target_fps": 0,
+            "duration": 0.0,
+            "size": 0,
+            "audio_bitrate": 0,
+            "trial": None,
             "bitrate": 0,
             "bitrate_source": "",
             "bpp": 0.0,
@@ -1761,22 +1896,26 @@ class SmartScanWorker(QThread):
         fmt = data.get("format", {}) or {}
         width = int(video.get("width") or 0)
         height = int(video.get("height") or 0)
-        fps = (parse_frame_rate(video.get("r_frame_rate"))
-               or parse_frame_rate(video.get("avg_frame_rate")))
+        # bpp 用平均帧率算更贴近真实内容；名义帧率只用来判断 VFR
+        r_fps = parse_frame_rate(video.get("r_frame_rate"))
+        avg_fps = parse_frame_rate(video.get("avg_frame_rate"))
+        fps = avg_fps or r_fps
+        vfr = is_vfr(r_fps, avg_fps)
+
+        duration = self._float(fmt.get("duration"))
+        size = self._int(fmt.get("size")) or os.path.getsize(path)
+        audio_rate = 0
+        for s in data.get("streams", []):
+            if s.get("codec_type") == "audio":
+                audio_rate += self._int(s.get("bit_rate"))
 
         vbitrate = self._int(video.get("bit_rate"))
         source = "视频流码率"
         if vbitrate <= 0:
             total_rate = self._int(fmt.get("bit_rate"))
             if total_rate <= 0:
-                size = self._int(fmt.get("size"))
-                duration = self._float(fmt.get("duration"))
                 if size > 0 and duration > 0:
                     total_rate = int(size * 8 / duration)
-            audio_rate = 0
-            for s in data.get("streams", []):
-                if s.get("codec_type") == "audio":
-                    audio_rate += self._int(s.get("bit_rate"))
             if total_rate > 0:
                 if 0 < audio_rate < total_rate:
                     vbitrate = total_rate - audio_rate
@@ -1791,6 +1930,13 @@ class SmartScanWorker(QThread):
             "width": width,
             "height": height,
             "fps": fps,
+            "r_fps": r_fps,
+            "avg_fps": avg_fps,
+            "vfr": vfr,
+            "target_fps": derive_target_fps(avg_fps or r_fps) if vfr else 0,
+            "duration": duration,
+            "size": size,
+            "audio_bitrate": audio_rate,
             "bitrate": vbitrate,
             "bitrate_source": source,
         })
@@ -1799,7 +1945,7 @@ class SmartScanWorker(QThread):
             item["reason"] = "分辨率无效"
             return item
         if fps <= 0:
-            item["reason"] = "帧率无效（可能是 VFR）"
+            item["reason"] = "帧率无效"
             return item
         if vbitrate <= 0:
             item["reason"] = "无法获取视频码率"
@@ -1807,7 +1953,10 @@ class SmartScanWorker(QThread):
 
         bpp = vbitrate / (width * height * fps)
         factor, skip, review = smart_thresholds(item["codec"], item["encoder"])
-        if bpp < skip:
+        if vfr and bpp < review:
+            # VFR 的 bpp 不可靠（帧率口径不一致 + 帧间冗余高），交给试压判断
+            verdict = "vfr"
+        elif bpp < skip:
             verdict = "skip"
         elif bpp < review:
             verdict = "review"
@@ -1839,18 +1988,222 @@ class SmartScanWorker(QThread):
             return 0.0
 
 
+class SmartTrialWorker(QThread):
+    """抽样试压：用与正式压缩相同的参数压两段短片，按比例估算全片体积
+
+    只对 VFR 或用户手动勾选的文件跑，避免批量时每个文件都多花十几秒。
+    """
+
+    progress_signal = pyqtSignal(int, int, str)   # 已完成, 总数, 当前文件名
+    file_signal = pyqtSignal(int, dict)           # 行号, 试压结果
+    finished_signal = pyqtSignal(bool)            # 是否被取消
+    log_signal = pyqtSignal(str)                  # 命令行与过程输出（转到主日志）
+
+    def __init__(self, ffmpeg_path, ffprobe_path, jobs):
+        super().__init__()
+        self.ffmpeg_path = ffmpeg_path
+        self.ffprobe_path = ffprobe_path
+        self.jobs = jobs            # [{row, path, name, crf, fps, duration, size, audio_bitrate}]
+        self.is_stopped = False
+        self._proc = None
+
+    def stop_process(self):
+        self.is_stopped = True
+        proc = self._proc
+        if proc:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def run(self):
+        total = len(self.jobs)
+        for idx, job in enumerate(self.jobs):
+            if self.is_stopped:
+                break
+            self.log_signal.emit(
+                "🧪 试压 {}/{}：{}".format(idx + 1, total, job["name"])
+            )
+            self.progress_signal.emit(idx, total, job["name"])
+            result = self._trial_one(job)
+            self.file_signal.emit(job["row"], result)
+            self.progress_signal.emit(idx + 1, total, job["name"])
+        self.finished_signal.emit(self.is_stopped)
+
+    def _trial_one(self, job):
+        duration = job.get("duration") or 0
+        if duration <= 0:
+            return {"ok": False, "error": "时长未知", "saving": 0.0, "est_bytes": 0}
+
+        window = min(SMART_TRIAL_SECONDS, max(duration / 3.0, 0.5))
+        tmpdir = tempfile.mkdtemp(prefix="ffmpeg-gui-trial-")
+        total_bytes = 0
+        total_secs = 0.0
+        ok_samples = 0
+        try:
+            for idx, ratio in enumerate(SMART_TRIAL_POINTS):
+                if self.is_stopped:
+                    break
+                start = duration * ratio - window / 2.0
+                start = max(0.0, min(start, max(duration - window, 0.0)))
+                out = os.path.join(tmpdir, "t%d.mp4" % idx)
+                cmd = [
+                    self.ffmpeg_path, "-y",
+                    "-ss", "{:.3f}".format(start), "-t", "{:.3f}".format(window),
+                    "-i", job["path"],
+                    "-an", "-sn", "-dn",
+                    "-c:v", "libx265", "-preset", "medium", "-crf", str(job["crf"]),
+                    "-x265-params", "log-level=error",
+                    "-pix_fmt", "yuv420p", "-tag:v", "hvc1",
+                ]
+                if job.get("fps"):
+                    cmd.extend(["-r", str(job["fps"])])
+                    if supports_fps_mode(self.ffmpeg_path):
+                        cmd.extend(["-fps_mode", "cfr"])
+                cmd.append(out)
+
+                self.log_signal.emit(
+                    "🧪 试压片段 {}/{}：{:.2f}s 起，长 {:.1f}s".format(
+                        idx + 1, len(SMART_TRIAL_POINTS), start, window
+                    )
+                )
+                self.log_signal.emit("   💻 " + subprocess.list2cmdline(cmd))
+
+                code, detail = self._run(cmd)
+                if code != 0 or not os.path.exists(out):
+                    self.log_signal.emit(
+                        "   ❌ 片段 {} 失败（返回码 {}）{}".format(
+                            idx + 1, code, ("　" + detail) if detail else ""
+                        )
+                    )
+                    continue
+                secs = self._probe_duration(out) or window
+                total_bytes += os.path.getsize(out)
+                total_secs += secs
+                ok_samples += 1
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        if ok_samples == 0 or total_secs <= 0:
+            self.log_signal.emit("   ⚠️ 试压没有成功的片段，无法估算")
+            return {"ok": False, "error": "试压失败", "saving": 0.0, "est_bytes": 0}
+
+        video_bps = total_bytes * 8.0 / total_secs
+        est_bytes = video_bps / 8.0 * duration + (job.get("audio_bitrate") or 0) / 8.0 * duration
+        source_size = job.get("size") or 0
+        saving = (1.0 - est_bytes / source_size) if source_size > 0 else 0.0
+
+        change = ("省 {:.0%}".format(saving) if saving >= 0
+                  else "反而增大 {:.0%}".format(-saving))
+        self.log_signal.emit(
+            "   📊 试压估算：{:.2f} MB（源 {:.2f} MB，{}）".format(
+                est_bytes / 1e6, source_size / 1e6, change
+            )
+        )
+        return {
+            "ok": True,
+            "samples": ok_samples,
+            "est_bytes": int(est_bytes),
+            "saving": saving,
+            "error": "",
+        }
+
+    def _run(self, cmd):
+        """执行一次片段试压，返回 (返回码, 出错时的最后一行输出)
+
+        输出用后台线程读取：主循环要留着轮询"停止"，不能阻塞在 readline 上。
+        """
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        try:
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                encoding="utf-8", errors="ignore", startupinfo=startupinfo,
+            )
+        except Exception as e:
+            self._proc = None
+            return -1, str(e)
+
+        proc = self._proc
+        stats = {"line": "", "err": ""}
+
+        def reader():
+            for raw in proc.stdout:
+                line = raw.strip()
+                if not line:
+                    continue
+                if is_progress_line(line):
+                    stats["line"] = normalize_progress_line(line)
+                elif "error" in line.lower():
+                    stats["err"] = line
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        try:
+            while True:
+                code = proc.poll()
+                if code is not None:
+                    break
+                if self.is_stopped:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    break
+                time.sleep(0.05)
+            thread.join(2.0)
+            if self.is_stopped:
+                return -1, "已停止"
+            if stats["line"]:
+                self.log_signal.emit("   " + stats["line"])
+            return proc.returncode, stats["err"]
+        finally:
+            self._proc = None
+
+    def _probe_duration(self, path):
+        if not self.ffprobe_path:
+            return 0.0
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            out = subprocess.run(
+                [self.ffprobe_path, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", path],
+                capture_output=True, text=True, encoding="utf-8", errors="ignore",
+                timeout=15, startupinfo=startupinfo,
+            ).stdout.strip()
+            return float(out) if out else 0.0
+        except Exception:
+            return 0.0
+
+
 class SmartScanDialog(QDialog):
-    """bpp 检测结果：勾选要送去压缩的文件"""
+    """bpp 检测结果：勾选要送去压缩的文件；VFR 文件可抽样试压后再决定"""
 
-    VERDICT_TEXT = {"ok": "可压", "review": "边缘", "skip": "跳过", "error": "检测失败"}
-    VERDICT_COLOR = {"ok": "#1D9E75", "review": "#BA7517", "skip": "#888780", "error": "#A32D2D"}
-    ORDER = {"ok": 0, "review": 1, "skip": 2, "error": 3}
+    VERDICT_TEXT = {
+        "ok": "可压", "review": "边缘", "vfr": "待试压",
+        "skip": "跳过", "error": "检测失败",
+    }
+    VERDICT_COLOR = {
+        "ok": "#1D9E75", "review": "#BA7517", "vfr": "#7A5AF8",
+        "skip": "#888780", "error": "#A32D2D",
+    }
+    ORDER = {"ok": 0, "review": 1, "vfr": 2, "skip": 3, "error": 4}
 
-    def __init__(self, results, parent=None):
+    def __init__(self, results, parent=None, ffmpeg_path=None, ffprobe_path=None,
+                 crf=22, log_sink=None):
         super().__init__(parent)
         self.setWindowTitle("bpp 检测结果")
-        self.resize(1000, 540)
-        self.setMinimumSize(860, 440)
+        self.resize(1000, 560)
+        self.setMinimumSize(860, 460)
+
+        self.ffmpeg_path = ffmpeg_path
+        self.ffprobe_path = ffprobe_path
+        self.crf = crf
+        self._trial = None
+        self._log = log_sink or (lambda text: None)
 
         self.results = sorted(
             results, key=lambda r: (self.ORDER[r["verdict"]], -r["bpp"])
@@ -1862,9 +2215,9 @@ class SmartScanDialog(QDialog):
         outer.setSpacing(8)
 
         title = QLabel(
-            "共检测 {} 个文件：可压 {} ｜ 边缘 {} ｜ 跳过 {} ｜ 失败 {}".format(
+            "共检测 {} 个文件：可压 {} ｜ 边缘 {} ｜ 待试压 {} ｜ 跳过 {} ｜ 失败 {}".format(
                 len(results), self._count("ok"), self._count("review"),
-                self._count("skip"), self._count("error"),
+                self._count("vfr"), self._count("skip"), self._count("error"),
             )
         )
         title.setStyleSheet("font-weight: bold;")
@@ -1874,7 +2227,7 @@ class SmartScanDialog(QDialog):
             "bpp = 视频码率 ÷ (宽 × 高 × 帧率)，数值越低说明源片压得越充分。\n"
             "跳过阈值按编码器折算：H.264 < {:.3f}、HEVC < {:.3f}、AV1 < {:.3f}；"
             "边缘区为阈值至 {:.3f}（H.264）。\n"
-            "默认只勾选「可压」的文件，边缘和跳过的文件可以手动勾选。".format(
+            "VFR（可变帧率）视频的 bpp 参考性较差，会标为「待试压」，建议用试压实测压缩比。".format(
                 SMART_BPP_SKIP, SMART_BPP_SKIP * 1.10,
                 SMART_BPP_SKIP * 1.15, SMART_BPP_REVIEW,
             )
@@ -1908,7 +2261,9 @@ class SmartScanDialog(QDialog):
         filter_row = QHBoxLayout()
         filter_row.addWidget(QLabel("显示："))
         self.combo_filter = QComboBox()
-        self.combo_filter.addItems(["全部", "仅建议压缩", "仅边缘", "仅跳过", "仅检测失败"])
+        self.combo_filter.addItems(
+            ["全部", "仅建议压缩", "仅边缘", "仅待试压", "仅跳过", "仅检测失败"]
+        )
         self.combo_filter.currentIndexChanged.connect(self._apply_filter)
         filter_row.addWidget(self.combo_filter)
         filter_row.addStretch()
@@ -1916,16 +2271,33 @@ class SmartScanDialog(QDialog):
         filter_row.addWidget(self.lbl_count)
         outer.addLayout(filter_row)
 
+        trial_row = QHBoxLayout()
+        self.trial_bar = QProgressBar()
+        self.trial_bar.setTextVisible(True)
+        self.trial_bar.setVisible(False)
+        self.lbl_trial = QLabel("")
+        self.lbl_trial.setVisible(False)
+        trial_row.addWidget(self.trial_bar, 1)
+        trial_row.addWidget(self.lbl_trial)
+        outer.addLayout(trial_row)
+
         btn_row = QHBoxLayout()
         self.btn_all = QPushButton("全选")
         self.btn_none = QPushButton("全不选")
         self.btn_suggest = QPushButton("仅选建议压缩")
+        self.btn_trial = QPushButton("🧪 试压")
+        self.btn_trial.setToolTip(
+            "对所有 VFR 文件 + 已勾选的文件做抽样试压：\n"
+            "按正式压缩参数各压两段 6 秒短片，估算全片体积。\n"
+            "也可先勾选其它文件，再一起试压。"
+        )
         self.btn_cancel = QPushButton("取消")
         self.btn_add = QPushButton("一键添加")
         self.btn_add.setObjectName("primaryButton")
         btn_row.addWidget(self.btn_all)
         btn_row.addWidget(self.btn_none)
         btn_row.addWidget(self.btn_suggest)
+        btn_row.addWidget(self.btn_trial)
         btn_row.addStretch()
         btn_row.addWidget(self.btn_cancel)
         btn_row.addWidget(self.btn_add)
@@ -1934,6 +2306,7 @@ class SmartScanDialog(QDialog):
         self.btn_all.clicked.connect(lambda: self._set_all(True))
         self.btn_none.clicked.connect(lambda: self._set_all(False))
         self.btn_suggest.clicked.connect(self._set_suggest)
+        self.btn_trial.clicked.connect(self._toggle_trial)
         self.btn_cancel.clicked.connect(self.reject)
         self.btn_add.clicked.connect(self.accept)
 
@@ -1966,8 +2339,12 @@ class SmartScanDialog(QDialog):
             tech = "{} · {}×{} · {:.2f}fps".format(
                 codec, r["width"], r["height"], r["fps"]
             )
+            if r.get("vfr"):
+                tech += " · VFR"
             if r["verdict"] == "review":
                 note = "阈值区间 {:.3f}–{:.3f}，可手动勾选".format(r["skip"], r["review"])
+            elif r["verdict"] == "vfr":
+                note = "VFR 帧率不稳，bpp 仅供参考"
             elif r["verdict"] == "skip":
                 note = "低于 {:.3f}，压缩收益小".format(r["skip"])
             else:
@@ -1988,7 +2365,7 @@ class SmartScanDialog(QDialog):
 
         verdict = QTableWidgetItem(self.VERDICT_TEXT[r["verdict"]])
         verdict.setForeground(QColor(self.VERDICT_COLOR[r["verdict"]]))
-        verdict.setToolTip(note)
+        verdict.setToolTip(self._tip_for(r, note))
         self.table.setItem(row, 5, verdict)
 
         note_item = QTableWidgetItem(note)
@@ -1999,9 +2376,20 @@ class SmartScanDialog(QDialog):
 
         self.table.setRowHeight(row, 44)
 
+    @staticmethod
+    def _tip_for(r, note):
+        """判定列/说明列的悬停提示：补上列里放不下的细节"""
+        if not r.get("ok"):
+            return note
+        if r.get("vfr"):
+            return "{}（名义 {:.2f}fps / 平均 {:.2f}fps，压缩时规整为 {}fps）".format(
+                note, r["r_fps"], r["avg_fps"], r["target_fps"]
+            )
+        return note
+
     def _apply_filter(self):
         mode = self.combo_filter.currentIndex()
-        wanted = {0: None, 1: "ok", 2: "review", 3: "skip", 4: "error"}[mode]
+        wanted = {0: None, 1: "ok", 2: "review", 3: "vfr", 4: "skip", 5: "error"}[mode]
         for row, r in enumerate(self.results):
             self.table.setRowHidden(row, wanted is not None and r["verdict"] != wanted)
 
@@ -2032,7 +2420,148 @@ class SmartScanDialog(QDialog):
     def _update_count(self, *_):
         n = len(self.selected_results())
         self.lbl_count.setText("已选 {} 个".format(n))
-        self.btn_add.setEnabled(n > 0)
+        self.btn_add.setEnabled(n > 0 and not self._trial_running())
+        self._update_trial_button()
+
+    # ---------- 抽样试压 ----------
+    def _trial_running(self):
+        return bool(self._trial and self._trial.isRunning())
+
+    def _trial_targets(self):
+        """试压对象 = 所有 VFR 文件 + 已勾选的文件（便于手动追加验证其它条目）"""
+        rows = []
+        for row, r in enumerate(self.results):
+            if not r["ok"] or r.get("trial"):
+                continue
+            if r.get("vfr") or self.check_boxes[row].isChecked():
+                rows.append(row)
+        return rows
+
+    def _update_trial_button(self):
+        if self._trial_running():
+            return
+        n = len(self._trial_targets())
+        self.btn_trial.setEnabled(n > 0)
+        self.btn_trial.setText("🧪 试压（{}）".format(n) if n else "🧪 试压")
+
+    def _toggle_trial(self):
+        if self._trial_running():
+            self._trial.stop_process()
+            self.btn_trial.setEnabled(False)
+            self.lbl_trial.setText("正在停止…")
+            return
+        self._start_trial()
+
+    def _start_trial(self):
+        rows = self._trial_targets()
+        if not rows:
+            return
+        jobs = []
+        for row in rows:
+            r = self.results[row]
+            jobs.append({
+                "row": row,
+                "path": r["path"],
+                "name": r["name"],
+                "crf": self.crf,
+                # 正式压缩时会给 VFR 文件规整帧率，试压必须用同样的参数
+                "fps": r.get("target_fps") if r.get("vfr") else 0,
+                "duration": r["duration"],
+                "size": r["size"],
+                "audio_bitrate": r["audio_bitrate"],
+            })
+
+        self._set_trial_running(True, len(jobs))
+        self._log(
+            "\n🧪 开始试压 {} 个文件（每个 2 段 × {:.0f} 秒，CRF {}）".format(
+                len(jobs), SMART_TRIAL_SECONDS, self.crf
+            )
+        )
+        self._trial = SmartTrialWorker(self.ffmpeg_path, self.ffprobe_path, jobs)
+        self._trial.progress_signal.connect(self._on_trial_progress)
+        self._trial.file_signal.connect(self._on_trial_file)
+        self._trial.finished_signal.connect(self._on_trial_finished)
+        self._trial.log_signal.connect(self._on_trial_log)   # 经对话框转发到主日志
+        self._trial.start()
+
+    def _on_trial_log(self, text):
+        self._log(text)
+
+    def _set_trial_running(self, running, total=0):
+        for w in (self.btn_all, self.btn_none, self.btn_suggest,
+                  self.btn_cancel, self.btn_add):
+            w.setEnabled(not running)
+        self.combo_filter.setEnabled(not running)
+        self.trial_bar.setVisible(running)
+        self.lbl_trial.setVisible(running)
+        if running:
+            self.trial_bar.setRange(0, max(total, 1))
+            self.trial_bar.setValue(0)
+            self.btn_trial.setEnabled(True)
+            self.btn_trial.setText("⏹ 停止试压")
+            self.lbl_trial.setText("准备中…")
+        else:
+            self.btn_trial.setText("🧪 试压")
+            self.lbl_trial.setText("")
+
+    def _on_trial_progress(self, done, total, name):
+        self.trial_bar.setRange(0, max(total, 1))
+        self.trial_bar.setValue(done)
+        self.lbl_trial.setText("试压 {}/{}：{}".format(min(done + 1, total), total, name))
+
+    def _on_trial_file(self, row, data):
+        r = self.results[row]
+        r["trial"] = data
+        note_item = self.table.item(row, 6)
+        verdict_item = self.table.item(row, 5)
+        if not data.get("ok"):
+            text = "试压失败：{}".format(data.get("error") or "未知原因")
+            note_item.setText(text)
+            note_item.setToolTip(text)
+            return
+
+        saving = data["saving"]
+        est_mb = data["est_bytes"] / 1e6
+        if saving >= SMART_TRIAL_SAVING:
+            r["verdict"] = "ok"
+            text = "试压：预计 {:.2f} MB（省 {:.0%}）".format(est_mb, saving)
+            self.check_boxes[row].setChecked(True)
+        else:
+            r["verdict"] = "skip"
+            if saving >= 0:
+                text = "试压：预计 {:.2f} MB（省 {:.0%}），收益不足".format(est_mb, saving)
+            else:
+                text = "试压：预计 {:.2f} MB，比源文件还大，建议跳过".format(est_mb)
+            self.check_boxes[row].setChecked(False)
+
+        verdict_item.setText(self.VERDICT_TEXT[r["verdict"]])
+        verdict_item.setForeground(QColor(self.VERDICT_COLOR[r["verdict"]]))
+        verdict_item.setToolTip(text)
+        note_item.setText(text)
+        note_item.setToolTip(text)
+        self._update_count()
+
+    def _on_trial_finished(self, cancelled):
+        self._set_trial_running(False)
+        if cancelled:
+            self.lbl_trial.setText("试压已停止")
+            self._log("⏹ 试压已停止")
+        else:
+            self._log("🧪 试压结束，命令行与过程输出见上方日志。")
+        self._update_count()
+
+    def _stop_trial_worker(self):
+        if self._trial_running():
+            self._trial.stop_process()
+            self._trial.wait(5000)
+
+    def reject(self):
+        self._stop_trial_worker()
+        super().reject()
+
+    def closeEvent(self, event):
+        self._stop_trial_worker()
+        super().closeEvent(event)
 
 
 # ==========================================
@@ -2052,6 +2581,7 @@ class MainWindow(QMainWindow):
         self._track_plan = None       # 轨道管理：当前文件的保留方案
         self._closing = False         # 关闭流程中，避免收尾弹窗打断退出
         self._smart_scanned = False   # 智能压缩：当前列表是否已完成 bpp 筛选
+        self._smart_profiles = {}     # 路径 -> 目标帧率（仅 VFR 文件需要规整）
         self.scan_worker = None
         self.log_writer = LogFileWriter()
 
@@ -2274,11 +2804,23 @@ class MainWindow(QMainWindow):
         self.log_text = LogView(self.log_writer)
         self.log_text.setReadOnly(True)
         self.log_text.setPlaceholderText("执行日志将显示在这里...")
-        self.log_text.setMinimumHeight(250)
+        self.log_text.setMinimumHeight(224)
+
+        # 任务完成后自动关机：空闲时也能勾选（可提前勾好再开始），本轮结束即自动取消
+        self.check_auto_shutdown = QCheckBox("任务完成后自动关机（60 秒倒计时，可取消）")
+        self.check_auto_shutdown.setToolTip(
+            "勾选后，这一轮任务跑完会执行 shutdown /s /t 60：\n"
+            "· Windows 会先弹出系统提示，60 秒后才真正关机\n"
+            "· 期间可在收尾弹窗点「取消关机」，或命令行执行 shutdown /a 撤销\n"
+            "· 手动停止、关闭程序、或一个任务都没跑时不会关机\n"
+            "· 任务若一直暂停着，不会触发（恢复并跑完才会计时）\n"
+            "· 只对当前这一轮有效，跑完自动取消勾选"
+        )
 
         run_layout.addWidget(self.progress_bar)
         run_layout.addLayout(btn_row)
         run_layout.addWidget(self.log_text)
+        run_layout.addWidget(self.check_auto_shutdown)
         run_group.setLayout(run_layout)
 
         # 添加到主布局
@@ -2386,7 +2928,7 @@ class MainWindow(QMainWindow):
     def update_mode_params(self, index):
         mode = self.combo_mode.currentText()
         # 切换模式后，之前的 bpp 筛选结果不再适用
-        self._smart_scanned = False
+        self._reset_smart_state()
 
         # 隐藏所有动态参数 (加入新增的控件)
         for w in [
@@ -2522,7 +3064,7 @@ class MainWindow(QMainWindow):
                 added += 1
 
         if added > 0:
-            self._smart_scanned = False
+            self._reset_smart_state()
             if not self.file_list.selectedItems():
                 self.file_list.setCurrentRow(0)
 
@@ -2625,12 +3167,12 @@ class MainWindow(QMainWindow):
     def remove_selected(self):
         for item in self.file_list.selectedItems():
             self.file_list.takeItem(self.file_list.row(item))
-        self._smart_scanned = False
+        self._reset_smart_state()
         self._update_track_button_state()
 
     def clear_files(self):
         self.file_list.clear()
-        self._smart_scanned = False
+        self._reset_smart_state()
         self._update_track_button_state()
 
     def select_subtitle(self):
@@ -2711,6 +3253,11 @@ class MainWindow(QMainWindow):
 
         return [(cmd, output_file)]
 
+    def _reset_smart_state(self):
+        """列表或处理模式变化后，bpp 筛选结果与 VFR 帧率方案都作废"""
+        self._smart_scanned = False
+        self._smart_profiles = {}
+
     def _build_smart_tasks(self, suffix, crf_val):
         """智能压缩：按极简压缩的 CPU 参数生成任务（列表已由 bpp 筛选）"""
         if not self._smart_scanned:
@@ -2740,6 +3287,12 @@ class MainWindow(QMainWindow):
                 "-x265-params", "log-level=error",
                 "-pix_fmt", "yuv420p", "-tag:v", "hvc1",
             ]
+            # VFR 源：规整成固定帧率，消除时间轴抖动并顺手丢掉重复帧
+            target_fps = self._smart_profiles.get(os.path.normpath(input_file))
+            if target_fps:
+                cmd.extend(["-r", str(int(target_fps))])
+                if supports_fps_mode(self.ffmpeg_path):
+                    cmd.extend(["-fps_mode", "cfr"])
             if self.check_smart_audio.isChecked():
                 cmd.append("__SMART_AUDIO__")
             else:
@@ -3076,7 +3629,13 @@ class MainWindow(QMainWindow):
 
         self._log_scan_report(results)
 
-        dlg = SmartScanDialog(results, self)
+        dlg = SmartScanDialog(
+            results, self,
+            ffmpeg_path=self.ffmpeg_path,
+            ffprobe_path=self.ffprobe_path,
+            crf=self.spin_crf.value(),
+            log_sink=self.append_log,
+        )
         if dlg.exec_() != QDialog.Accepted:
             self.log_text.append("已取消筛选，列表保持不变。")
             return
@@ -3086,38 +3645,52 @@ class MainWindow(QMainWindow):
             return
 
         skipped = sum(1 for r in results if r["verdict"] == "skip")
+        trialed = sum(1 for r in results if r.get("trial") and r["trial"].get("ok"))
+
+        # VFR 文件在压缩时需要把帧率规整成固定值，这里把方案记下来给生成任务用
+        profiles = {}
+        for r in results:
+            if r.get("vfr") and r.get("target_fps"):
+                profiles[os.path.normpath(r["path"])] = int(r["target_fps"])
+
         self.file_list.clear()
         self._add_files_to_list(chosen)
         self._smart_scanned = True
+        self._smart_profiles = profiles
         self.log_text.append(
             "✅ 已用 {} 个文件替换列表（跳过 {} 个，源文件保持原位），"
             "点击「开始批量处理」开始压缩。".format(len(chosen), skipped)
         )
+        if trialed:
+            self.log_text.append("🧪 其中 {} 个文件做过抽样试压，结果见上方清单。".format(trialed))
 
     def _log_scan_report(self, results):
         ok = [r for r in results if r["verdict"] == "ok"]
         review = [r for r in results if r["verdict"] == "review"]
+        vfr = [r for r in results if r["verdict"] == "vfr"]
         skip = [r for r in results if r["verdict"] == "skip"]
         error = [r for r in results if r["verdict"] == "error"]
 
         self.log_text.append(
-            "\n📋 bpp 检测完成：共 {} 个 ｜ 可压 {} ｜ 边缘 {} ｜ 跳过 {} ｜ 失败 {}".format(
-                len(results), len(ok), len(review), len(skip), len(error)
+            "\n📋 bpp 检测完成：共 {} 个 ｜ 可压 {} ｜ 边缘 {} ｜ 待试压 {} ｜ 跳过 {} ｜ 失败 {}".format(
+                len(results), len(ok), len(review), len(vfr), len(skip), len(error)
             )
         )
 
         def fmt(r):
             if r["ok"]:
+                tag = "  [VFR]" if r.get("vfr") else ""
                 return (
-                    "  • {}  bpp {:.4f}  {} {}×{} {:.2f}fps  {:.2f} Mbps".format(
+                    "  • {}  bpp {:.4f}  {} {}×{} {:.2f}fps{}  {:.2f} Mbps".format(
                         r["path"], r["bpp"], r["codec"], r["width"],
-                        r["height"], r["fps"], r["bitrate"] / 1e6,
+                        r["height"], r["fps"], tag, r["bitrate"] / 1e6,
                     )
                 )
             return "  • {}  检测失败：{}".format(r["path"], r["reason"])
 
         for title, group in (
             ("✅ 可压", ok), ("⚠️ 边缘", review),
+            ("🔬 待试压（VFR，bpp 仅供参考）", vfr),
             ("⏭ 跳过", skip), ("❌ 失败", error),
         ):
             if not group:
@@ -3150,19 +3723,40 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(percentage)
 
     def append_log(self, text):
+        # 贴底跟随 / 原地不动、以及 3000 行截断，都由 LogView.append 统一处理
         self.log_text.append(text)
-        # 限制日志最多 3000 行，超出删除最旧的
-        MAX_LINES = 3000
-        doc = self.log_text.document()
-        if doc.blockCount() > MAX_LINES:
-            cursor = self.log_text.textCursor()
-            cursor.movePosition(cursor.Start)
-            cursor.movePosition(cursor.Down, cursor.KeepAnchor, doc.blockCount() - MAX_LINES)
-            cursor.removeSelectedText()
 
-        self.log_text.verticalScrollBar().setValue(
-            self.log_text.verticalScrollBar().maximum()
-        )
+    def schedule_shutdown(self, seconds=60):
+        """安排关机（延迟 seconds 秒，期间可用 shutdown /a 撤销）"""
+        try:
+            result = subprocess.run(
+                ["shutdown", "/s", "/t", str(int(seconds))],
+                creationflags=0x08000000,   # CREATE_NO_WINDOW：打包成无控制台版时不闪黑框
+                check=False,
+            )
+        except Exception as e:
+            self.log_text.append(f"❌ 无法安排自动关机：{e}")
+            return False
+        if result.returncode != 0:
+            self.log_text.append(f"❌ 自动关机未能安排（shutdown 返回码 {result.returncode}）")
+            return False
+        return True
+
+    def cancel_shutdown(self):
+        """撤销已安排的关机"""
+        try:
+            result = subprocess.run(
+                ["shutdown", "/a"], creationflags=0x08000000, check=False
+            )
+        except Exception as e:
+            self.log_text.append(f"❌ 取消关机失败：{e}")
+            return False
+        # 1116 = 当前没有待处理的关机，属于正常情况
+        if result.returncode not in (0, 1116):
+            self.log_text.append(f"❌ 取消关机失败（返回码 {result.returncode}）")
+            return False
+        self.log_text.append("✅ 已取消自动关机。")
+        return True
 
     def processing_finished(self, results=None):
         if self._closing:
@@ -3221,6 +3815,22 @@ class MainWindow(QMainWindow):
         else:
             self.log_text.append("\n🎉 全部任务处理完成！")
 
+        # ---- 自动关机：只在本轮真跑过任务、且没被手动中止时执行；一次性 ----
+        armed = self.check_auto_shutdown.isChecked()
+        shutdown_scheduled = False
+        if armed:
+            self.check_auto_shutdown.setChecked(False)   # 不把状态带到下一轮
+            if not results:
+                self.log_text.append("⏻ 本轮没有执行任何任务，自动关机未触发。")
+            elif stopped_items or not_run:
+                self.log_text.append("⏹ 任务被中止，自动关机未触发。")
+            elif self.schedule_shutdown(60):
+                shutdown_scheduled = True
+                self.log_text.append(
+                    "⏻ 已安排 60 秒后自动关机"
+                    "（取消：点下方「取消关机」按钮，或命令行执行 shutdown /a）"
+                )
+
         # ---- 弹窗：成功、失败、中止用不同图标与标题 ----
         msg = QMessageBox(self)
         retry_note = (
@@ -3248,11 +3858,22 @@ class MainWindow(QMainWindow):
             msg.setInformativeText(
                 retry_note + f"共完成 {len(ok_items)} 个任务。是否打开输出文件夹？"
             )
+        if shutdown_scheduled:
+            msg.setInformativeText(
+                msg.informativeText()
+                + "\n\n60 秒后自动关机；还需继续用电脑的话，点「取消关机」。"
+            )
         btn_open = msg.addButton("📂 打开输出文件夹", QMessageBox.AcceptRole)
         msg.addButton("关闭", QMessageBox.RejectRole)
+        btn_cancel_shutdown = None
+        if shutdown_scheduled:
+            btn_cancel_shutdown = msg.addButton("🛑 取消关机", QMessageBox.DestructiveRole)
         msg.exec_()
-        if msg.clickedButton() == btn_open:
+        clicked = msg.clickedButton()
+        if clicked == btn_open:
             self.open_output_folder()
+        elif btn_cancel_shutdown is not None and clicked == btn_cancel_shutdown:
+            self.cancel_shutdown()
 
     def toggle_pause(self):
         if hasattr(self, "worker") and self.worker.isRunning():
