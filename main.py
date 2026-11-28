@@ -711,7 +711,7 @@ def smart_thresholds(codec_name, encoder_tag=""):
     return factor, SMART_BPP_SKIP * factor, SMART_BPP_REVIEW * factor
 
 
-# ---- VFR（可变帧率）判定与帧率规整 ----
+# ---- VFR（可变帧率）判定与试压 ----
 SMART_VFR_TOLERANCE = 0.02      # 名义帧率与平均帧率相差超过 2% 视为 VFR
 SMART_TRIAL_SAVING = 0.25       # 试压后预计省下 25% 以上才算"值得压"
 SMART_TRIAL_SECONDS = 6.0       # 单段试压时长
@@ -727,23 +727,12 @@ def is_vfr(r_fps, avg_fps):
     return abs(r_fps - avg_fps) > max(r_fps, avg_fps) * SMART_VFR_TOLERANCE
 
 
-def derive_target_fps(avg_fps):
-    """按平均帧率把 VFR 规整到常见帧率，避免把 60fps 素材硬砍成 30"""
-    if avg_fps <= 0:
-        return 30
-    if avg_fps < 24.5:
-        return 24
-    if avg_fps < 27:
-        return 25
-    if avg_fps < 45:
-        return 30
-    if avg_fps < 55:
-        return 50
-    return 60
-
-
 def supports_fps_mode(ffmpeg_path):
-    """-fps_mode 是 ffmpeg 5.0 才有的参数，旧版只能用 -r"""
+    """-fps_mode 是 ffmpeg 5.0 才有的参数，旧版不加这个参数（默认同样保留时间戳）
+
+    注意：这个函数会起一个子进程，不要在界面线程上临时调用（杀软扫 ffmpeg.exe
+    时可能卡上一两秒）。启动时由 warm_up_fps_mode() 在后台预热，结果缓存复用。
+    """
     if not ffmpeg_path:
         return False
     cached = _FPS_MODE_SUPPORT.get(ffmpeg_path)
@@ -751,9 +740,13 @@ def supports_fps_mode(ffmpeg_path):
         return cached
     ok = False
     try:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
         out = subprocess.run(
             [ffmpeg_path, "-version"], capture_output=True, text=True,
             encoding="utf-8", errors="ignore", timeout=15,
+            startupinfo=startupinfo, creationflags=0x08000000,
         ).stdout
         m = re.search(r"ffmpeg version\s+(?:n)?(\d+)", out)
         if m:
@@ -762,6 +755,16 @@ def supports_fps_mode(ffmpeg_path):
         ok = False
     _FPS_MODE_SUPPORT[ffmpeg_path] = ok
     return ok
+
+
+def warm_up_fps_mode(ffmpeg_path):
+    """启动后在后台把 -fps_mode 支持情况查好，避免生成任务时卡界面"""
+    if not ffmpeg_path:
+        return
+    try:
+        supports_fps_mode(ffmpeg_path)
+    except Exception:
+        pass
 
 
 def build_ext_filter(name, exts):
@@ -1842,7 +1845,6 @@ class SmartScanWorker(QThread):
             "r_fps": 0.0,
             "avg_fps": 0.0,
             "vfr": False,
-            "target_fps": 0,
             "duration": 0.0,
             "size": 0,
             "audio_bitrate": 0,
@@ -1933,7 +1935,6 @@ class SmartScanWorker(QThread):
             "r_fps": r_fps,
             "avg_fps": avg_fps,
             "vfr": vfr,
-            "target_fps": derive_target_fps(avg_fps or r_fps) if vfr else 0,
             "duration": duration,
             "size": size,
             "audio_bitrate": audio_rate,
@@ -2056,10 +2057,9 @@ class SmartTrialWorker(QThread):
                     "-x265-params", "log-level=error",
                     "-pix_fmt", "yuv420p", "-tag:v", "hvc1",
                 ]
-                if job.get("fps"):
-                    cmd.extend(["-r", str(job["fps"])])
-                    if supports_fps_mode(self.ffmpeg_path):
-                        cmd.extend(["-fps_mode", "cfr"])
+                if job.get("passthrough") and supports_fps_mode(self.ffmpeg_path):
+                    # 保留源时间戳，不补帧也不丢帧
+                    cmd.extend(["-fps_mode", "passthrough"])
                 cmd.append(out)
 
                 self.log_signal.emit(
@@ -2382,8 +2382,9 @@ class SmartScanDialog(QDialog):
         if not r.get("ok"):
             return note
         if r.get("vfr"):
-            return "{}（名义 {:.2f}fps / 平均 {:.2f}fps，压缩时规整为 {}fps）\n勾选后可点「试压」实测压缩比".format(
-                note, r["r_fps"], r["avg_fps"], r["target_fps"]
+            return ("{}（名义 {:.2f}fps / 平均 {:.2f}fps，压缩时保留原始时间戳，不改帧率）"
+                    "\n勾选后可点「试压」实测压缩比").format(
+                note, r["r_fps"], r["avg_fps"]
             )
         return note
 
@@ -2462,8 +2463,8 @@ class SmartScanDialog(QDialog):
                 "path": r["path"],
                 "name": r["name"],
                 "crf": self.crf,
-                # 正式压缩时会给 VFR 文件规整帧率，试压必须用同样的参数
-                "fps": r.get("target_fps") if r.get("vfr") else 0,
+                # 正式压缩对 VFR 文件保留原始时间戳，试压必须用同样的参数
+                "passthrough": bool(r.get("vfr")),
                 "duration": r["duration"],
                 "size": r["size"],
                 "audio_bitrate": r["audio_bitrate"],
@@ -2582,7 +2583,7 @@ class MainWindow(QMainWindow):
         self._track_plan = None       # 轨道管理：当前文件的保留方案
         self._closing = False         # 关闭流程中，避免收尾弹窗打断退出
         self._smart_scanned = False   # 智能压缩：当前列表是否已完成 bpp 筛选
-        self._smart_profiles = {}     # 路径 -> 目标帧率（仅 VFR 文件需要规整）
+        self._smart_vfr = set()       # 这批文件里哪些是 VFR（压缩时保留原始时间戳）
         self.scan_worker = None
         self.log_writer = LogFileWriter()
 
@@ -2876,6 +2877,10 @@ class MainWindow(QMainWindow):
             self.log_text.append(
                 "提示：可以直接把媒体文件/文件夹拖入列表，把字幕文件拖入字幕框。\n"
             )
+            # -fps_mode 支持情况在后台查好，避免点「开始批量处理」时现起子进程卡界面
+            threading.Thread(
+                target=warm_up_fps_mode, args=(self.ffmpeg_path,), daemon=True
+            ).start()
 
     def on_nvenc_toggled(self, state):
         """勾选 N卡 时，取消勾选 Intel"""
@@ -2897,14 +2902,19 @@ class MainWindow(QMainWindow):
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startupinfo.wShowWindow = subprocess.SW_HIDE
 
-            # 读取 ffmpeg 支持的编码器列表
-            cmd = [self.ffmpeg_path, "-hide_banner", "-encoders"]
+            # 一次调用同时拿到版本号和编码器列表（版本信息在 banner 里，走 stderr）
+            cmd = [self.ffmpeg_path, "-encoders"]
             result = subprocess.run(
-                cmd, capture_output=True, text=True, 
-                encoding='utf-8', errors='ignore', check=True,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding='utf-8', errors='ignore', check=True,
                 startupinfo=startupinfo
             )
             encoders = result.stdout
+
+            # 顺手把 -fps_mode 支持情况记进缓存，后面生成任务时不必再起进程
+            m = re.search(r"ffmpeg version\s+(?:n)?(\d+)", encoders)
+            if m:
+                _FPS_MODE_SUPPORT[self.ffmpeg_path] = int(m.group(1)) >= 5
 
             has_nvenc = "hevc_nvenc" in encoders
             has_qsv = "hevc_qsv" in encoders
@@ -3255,9 +3265,9 @@ class MainWindow(QMainWindow):
         return [(cmd, output_file)]
 
     def _reset_smart_state(self):
-        """列表或处理模式变化后，bpp 筛选结果与 VFR 帧率方案都作废"""
+        """列表或处理模式变化后，bpp 筛选结果与 VFR 名单都作废"""
         self._smart_scanned = False
-        self._smart_profiles = {}
+        self._smart_vfr = set()
 
     def _build_smart_tasks(self, suffix, crf_val):
         """智能压缩：按极简压缩的 CPU 参数生成任务（列表已由 bpp 筛选）"""
@@ -3288,12 +3298,11 @@ class MainWindow(QMainWindow):
                 "-x265-params", "log-level=error",
                 "-pix_fmt", "yuv420p", "-tag:v", "hvc1",
             ]
-            # VFR 源：规整成固定帧率，消除时间轴抖动并顺手丢掉重复帧
-            target_fps = self._smart_profiles.get(os.path.normpath(input_file))
-            if target_fps:
-                cmd.extend(["-r", str(int(target_fps))])
-                if supports_fps_mode(self.ffmpeg_path):
-                    cmd.extend(["-fps_mode", "cfr"])
+            # VFR 源：保留原始时间戳，不补帧也不丢帧（只改编码，不动时间轴）
+            # 只读启动时缓存的结果，这里绝不能现起子进程，否则界面会卡住
+            if (os.path.normpath(input_file) in self._smart_vfr
+                    and _FPS_MODE_SUPPORT.get(self.ffmpeg_path) is True):
+                cmd.extend(["-fps_mode", "passthrough"])
             if self.check_smart_audio.isChecked():
                 cmd.append("__SMART_AUDIO__")
             else:
@@ -3648,16 +3657,13 @@ class MainWindow(QMainWindow):
         skipped = sum(1 for r in results if r["verdict"] == "skip")
         trialed = sum(1 for r in results if r.get("trial") and r["trial"].get("ok"))
 
-        # VFR 文件在压缩时需要把帧率规整成固定值，这里把方案记下来给生成任务用
-        profiles = {}
-        for r in results:
-            if r.get("vfr") and r.get("target_fps"):
-                profiles[os.path.normpath(r["path"])] = int(r["target_fps"])
+        # 记下哪些文件是 VFR，压缩时对它们保留原始时间戳
+        vfr_paths = {os.path.normpath(r["path"]) for r in results if r.get("vfr")}
 
         self.file_list.clear()
         self._add_files_to_list(chosen)
         self._smart_scanned = True
-        self._smart_profiles = profiles
+        self._smart_vfr = vfr_paths
         self.log_text.append(
             "✅ 已用 {} 个文件替换列表（跳过 {} 个，源文件保持原位），"
             "点击「开始批量处理」开始压缩。".format(len(chosen), skipped)
